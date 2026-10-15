@@ -1,4 +1,4 @@
-//! 测试辅助（vendored 子集）：[`temp_config_file`] 临时 TOML 文件（drop 时删除）。
+//! 集成测试共享辅助。
 
 /// Create a temporary TOML config file in the system temp dir.
 ///

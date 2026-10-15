@@ -2,12 +2,14 @@
 //! 必须原样带回 `group_members_open`（群成员放行开关）——否则 Panel 的
 //! 任一名单编辑都会把开关静默清掉。同时覆盖"运行时改名单立即落盘"。
 
+mod common;
+
 use echo_adapter_qq::config::QqAdapterConfig;
 use echo_adapter_qq::QqAdapter;
 
 #[test]
 fn update_allowlist_persists_group_members_open() {
-    let file = echo_test_utils::temp_config_file(
+    let file = common::temp_config_file(
         "group-members-open",
         "[adapters.qq]\nenabled = false\n\n\
          [adapters.qq.filter.allowlist]\nuser_ids = [1]\ngroup_ids = [2]\n\
@@ -20,7 +22,7 @@ fn update_allowlist_persists_group_members_open() {
     config.filter.allowlist.group_members_open = true;
 
     let adapter = QqAdapter::new(config);
-    adapter.set_config_store(echo_adapter::ConfigStore::new(file.path().to_path_buf()));
+    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(file.path().to_path_buf()));
 
     // 模拟 Panel 交互：运行时替换名单 → 触发 rebuild + persist。
     adapter.update_allowlist(vec![3], vec![4]);
@@ -48,7 +50,7 @@ fn update_allowlist_persists_group_members_open() {
 #[test]
 fn update_allowlist_persists_group_members_open_false_as_is() {
     // 关闭态同样必须显式落盘（false 不是"缺省"，而是明确的口径）。
-    let file = echo_test_utils::temp_config_file(
+    let file = common::temp_config_file(
         "group-members-closed",
         "[adapters.qq]\nenabled = false\n\n[adapters.qq.filter.allowlist]\n\
          user_ids = [11]\ngroup_ids = [22]\n",
@@ -59,7 +61,7 @@ fn update_allowlist_persists_group_members_open_false_as_is() {
     config.filter.allowlist.group_ids = vec![22];
 
     let adapter = QqAdapter::new(config);
-    adapter.set_config_store(echo_adapter::ConfigStore::new(file.path().to_path_buf()));
+    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(file.path().to_path_buf()));
     adapter.update_allowlist(vec![33], vec![44]);
 
     let text = std::fs::read_to_string(file.path()).expect("read persisted config");

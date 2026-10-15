@@ -8,11 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-echo-adapter = { path = "../../vendor/echo-adapter" }
 # 开发期：本机 path 依赖（SDK 未发布通道）；发布后切 git tag。
 echo-plugin-sdk = { path = "/home/evence/.local/share/echo-agent-core/source/source/plugin/echo-plugin-sdk" }
 echo-core = { path = "../echo-core" }
-echo-defs = { path = "../../vendor/echo-defs" }
 echo-server = { path = "../echo-server" }
 tokio.workspace = true
 futures-util.workspace = true
@@ -30,7 +28,7 @@ reqwest.workspace = true
 base64.workspace = true
 toml.workspace = true
 sha2.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
-echo-test-utils = { path = "../../vendor/echo-test-utils" }
 wiremock = "0.6"

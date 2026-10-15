@@ -1,6 +1,6 @@
 //! Configuration types for the QQ adapter.
 
-use echo_adapter::filter::{
+use crate::filter::{
     AdminBypassFilter, AllowlistFilter, ContentLengthFilter, DenylistFilter, FilterPipeline,
     KeywordBlockFilter, RateLimitEntry, RateLimitFilter,
 };
@@ -635,16 +635,16 @@ mode = "allowlist"
         cfg.filter.allowlist.group_ids = vec![1094762376, 1091798103];
         let pipeline = cfg.build_filter_pipeline_gated("allowlist");
 
-        let msg = |user: &str, group: Option<&str>| echo_adapter::types::IncomingMessage {
+        let msg = |user: &str, group: Option<&str>| crate::types::IncomingMessage {
             adapter_name: "qq".into(),
             platform: "qq".into(),
             user_id: user.into(),
             user_name: "tester".into(),
             channel: match group {
-                Some(gid) => echo_adapter::types::ChannelType::Group {
+                Some(gid) => crate::types::ChannelType::Group {
                     group_id: gid.into(),
                 },
-                None => echo_adapter::types::ChannelType::Direct,
+                None => crate::types::ChannelType::Direct,
             },
             group_name: None,
             content: "hi".into(),
@@ -709,16 +709,16 @@ mode = "allowlist"
         cfg.filter.allowlist.group_members_open = true;
         let pipeline = cfg.build_filter_pipeline_gated("allowlist");
 
-        let msg = |user: &str, group: Option<&str>| echo_adapter::types::IncomingMessage {
+        let msg = |user: &str, group: Option<&str>| crate::types::IncomingMessage {
             adapter_name: "qq".into(),
             platform: "qq".into(),
             user_id: user.into(),
             user_name: "tester".into(),
             channel: match group {
-                Some(gid) => echo_adapter::types::ChannelType::Group {
+                Some(gid) => crate::types::ChannelType::Group {
                     group_id: gid.into(),
                 },
-                None => echo_adapter::types::ChannelType::Direct,
+                None => crate::types::ChannelType::Direct,
             },
             group_name: None,
             content: "hi".into(),

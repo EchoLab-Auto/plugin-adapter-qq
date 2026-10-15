@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use echo_adapter::types::{AdapterEvent, ChannelType, IncomingFile, IncomingMessage};
+use crate::types::{AdapterEvent, ChannelType, IncomingFile, IncomingMessage};
 use echo_core::{Event as OneBotEvent, NoticeEvent};
 use echo_server::{Context, HandleResult};
 
@@ -167,7 +167,7 @@ impl echo_server::Handler for QqHandler {
         // 被门控（群聊非 @我 / dm_auto_reply=false）或过滤拦截的消息也会白存
         // 图片，媒体库积累无主文件。模型侧在发往 LLM 前由
         // `media_store::inline_media_refs_in_messages` 还原。
-        msg = persist_remote_images(msg).await;
+        msg = persist_remote_images(msg, self.media_store()).await;
         // 私聊文件（消息 file 段）：在过滤通过后下载，避免被拦截的消息
         // 白白拉取大文件。
         self.resolve_pending_files(&mut msg).await;
@@ -184,6 +184,15 @@ impl echo_server::Handler for QqHandler {
 }
 
 impl QqHandler {
+    /// 当前媒体登记通道（插件入口在握手后注入；未注入 = 保留原 URL）。
+    fn media_store(&self) -> Option<Arc<dyn crate::media::MediaStore>> {
+        self.inner
+            .media_store
+            .lock()
+            .expect("media store poisoned")
+            .clone()
+    }
+
     /// 把 `group_upload` 通知转换成内部 IncomingMessage（含待下载登记）。
     fn group_upload_message(&self, event: &OneBotEvent) -> Option<IncomingMessage> {
         let OneBotEvent::Notice {
@@ -440,29 +449,37 @@ fn image_client() -> reqwest::Client {
     .clone()
 }
 
-/// 把消息里的远程图片 URL 逐个下载并落盘，改写为 `/media/<id>` 引用；
-/// 下载/落盘失败的保留原 URL（请求构建侧的占位替换会兜住过期链接，
-/// 不会再毒化请求）。
-async fn persist_remote_images(mut msg: IncomingMessage) -> IncomingMessage {
+/// 把消息里的远程图片 URL 逐个下载并经 [`crate::media::MediaStore`] 登记
+/// （宿主媒体库），改写为 `/media/<id>` 引用；下载/登记失败的保留原 URL
+/// （请求构建侧的占位替换会兜住过期链接，不会再毒化请求）。
+/// 未注入媒体通道（宿主握手完成前）时原样返回。
+async fn persist_remote_images(
+    mut msg: IncomingMessage,
+    store: Option<Arc<dyn crate::media::MediaStore>>,
+) -> IncomingMessage {
     if msg.images.is_empty() {
         return msg;
     }
+    let Some(store) = store else {
+        tracing::debug!("media store not installed; keeping original image URLs");
+        return msg;
+    };
     let mut images = Vec::with_capacity(msg.images.len());
     for image in std::mem::take(&mut msg.images) {
-        images.push(persist_remote_image(image).await);
+        images.push(persist_remote_image(image, &store).await);
     }
     msg.images = images;
     msg
 }
 
-async fn persist_remote_image(url: String) -> String {
-    if echo_defs::media_store::is_media_ref(&url)
+async fn persist_remote_image(url: String, store: &Arc<dyn crate::media::MediaStore>) -> String {
+    if crate::media::is_media_ref(&url)
         || url.starts_with("data:")
         || !url.starts_with("http")
     {
         return url;
     }
-    match download_and_store(&url).await {
+    match download_and_store(&url, store).await {
         Ok(reference) => reference,
         Err(error) => {
             tracing::warn!(%error, "image download/store failed, keeping original URL");
@@ -472,7 +489,10 @@ async fn persist_remote_image(url: String) -> String {
 }
 
 /// 下载远端图片并落盘，返回 `/media/<id>` 引用。
-async fn download_and_store(url: &str) -> Result<String, String> {
+async fn download_and_store(
+    url: &str,
+    store: &Arc<dyn crate::media::MediaStore>,
+) -> Result<String, String> {
     let resp = image_client()
         .get(url)
         .send()
@@ -509,8 +529,7 @@ async fn download_and_store(url: &str) -> Result<String, String> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    let id = echo_defs::media_store::save_image_bytes(&bytes, &mime)?;
-    Ok(echo_defs::media_store::media_ref(&id))
+    store.store_image(&bytes, &mime).await
 }
 
 #[cfg(test)]
@@ -527,7 +546,7 @@ mod tests {
     /// A scriptable inbound hook for handler tests.
     struct MockHook {
         result: StdMutex<Option<Result<(), String>>>,
-        messages: StdMutex<Vec<echo_adapter::IncomingMessage>>,
+        messages: StdMutex<Vec<crate::types::IncomingMessage>>,
     }
 
     impl MockHook {
@@ -540,10 +559,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl echo_adapter::InboundMessageHook for MockHook {
+    impl crate::types::InboundMessageHook for MockHook {
         async fn on_incoming_message(
             &self,
-            msg: echo_adapter::IncomingMessage,
+            msg: crate::types::IncomingMessage,
         ) -> Result<(), String> {
             self.messages.lock().unwrap().push(msg);
             self.result.lock().unwrap().take().unwrap_or(Ok(()))
@@ -583,6 +602,7 @@ mod tests {
             napcat_config_task: StdMutex::new(None),
             tracker: echo_server::ConnectionTracker::default(),
             message_hook: StdMutex::new(None),
+            media_store: StdMutex::new(None),
             extra_handlers: StdMutex::new(Vec::new()),
             runtime_allowlist_users: StdMutex::new(Vec::new()),
             runtime_allowlist_groups: StdMutex::new(Vec::new()),
@@ -1121,7 +1141,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_error_does_not_send_platform_message() {
-        let hook: Arc<dyn echo_adapter::InboundMessageHook> =
+        let hook: Arc<dyn crate::types::InboundMessageHook> =
             Arc::new(MockHook::new(Err("llm down".into())));
         let inner = test_inner(QqTriggerConfig::default());
         *inner.message_hook.lock().unwrap() = Some(hook);
@@ -1150,28 +1170,28 @@ mod tests {
         let event = sub_rx.recv().await.expect("subscriber notified");
         assert!(matches!(
             event,
-            echo_adapter::AdapterEvent::MessageReceived(_)
+            crate::types::AdapterEvent::MessageReceived(_)
         ));
     }
 
-    /// 媒体落盘测试的进程级环境变量锁：`ECHO_MEDIA_DIR` 是进程级，多个测试
-    /// 并行设置/清除会互相踩（tokio Mutex：跨 await 持有不触发
-    /// clippy::await_holding_lock）。
-    static MEDIA_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// 记录型媒体登记通道：断言下载字节与 MIME 经 `MediaStore` 上交
+    /// （替代原 `ECHO_MEDIA_DIR` 落盘断言）。
+    #[derive(Default)]
+    struct FakeMediaStore {
+        saved: StdMutex<Vec<(Vec<u8>, String)>>,
+    }
 
-    /// 媒体落盘测试共享一个隔离目录（环境变量是进程级，串行化）。
-    fn media_test_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "echo-adapter-qq-media-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    #[async_trait]
+    impl crate::media::MediaStore for FakeMediaStore {
+        async fn store_image(&self, bytes: &[u8], mime: &str) -> Result<String, String> {
+            let mut saved = self.saved.lock().unwrap();
+            saved.push((bytes.to_vec(), mime.to_string()));
+            Ok(format!("/media/fake-{}.png", saved.len() - 1))
+        }
     }
 
     #[tokio::test]
-    async fn download_and_store_writes_media_file() {
+    async fn download_and_store_hands_bytes_to_media_store() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1186,20 +1206,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _serial = MEDIA_ENV_LOCK.lock().await;
-        let dir = media_test_dir("store");
-        std::env::set_var("ECHO_MEDIA_DIR", &dir);
-        let reference = download_and_store(&format!("{}/img.png", server.uri()))
+        let recorder = Arc::new(FakeMediaStore::default());
+        let store: Arc<dyn crate::media::MediaStore> = recorder.clone();
+        let reference = download_and_store(&format!("{}/img.png", server.uri()), &store)
             .await
             .expect("download+store succeeds");
-        std::env::remove_var("ECHO_MEDIA_DIR");
-        assert!(reference.starts_with("/media/"), "{reference}");
-        assert!(reference.ends_with(".png"), "{reference}");
-        // 落盘文件的内容与源一致
-        let id = echo_defs::media_store::id_of_ref(&reference).unwrap();
-        let stored = std::fs::read(dir.join(id)).expect("media file exists");
-        assert_eq!(stored, vec![1u8, 2, 3]);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reference, "/media/fake-0.png");
+        // 登记的字节与 MIME 与源一致
+        let saved = recorder.saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, vec![1u8, 2, 3]);
+        assert_eq!(saved[0].1, "image/png");
     }
 
     #[tokio::test]
@@ -1213,20 +1230,32 @@ mod tests {
             .mount(&server)
             .await;
 
+        let recorder = Arc::new(FakeMediaStore::default());
+        let store: Arc<dyn crate::media::MediaStore> = recorder.clone();
         let url = format!("{}/missing.png", server.uri());
         assert_eq!(
-            persist_remote_image(url.clone()).await,
+            persist_remote_image(url.clone(), &store).await,
             url,
             "failed downloads keep the original URL"
+        );
+        assert!(
+            recorder.saved.lock().unwrap().is_empty(),
+            "nothing registered on failure"
         );
     }
 
     #[tokio::test]
     async fn persist_remote_image_passes_through_data_uris_and_refs() {
+        let recorder = Arc::new(FakeMediaStore::default());
+        let store: Arc<dyn crate::media::MediaStore> = recorder.clone();
         let data = "data:image/png;base64,QUJD".to_string();
-        assert_eq!(persist_remote_image(data.clone()).await, data);
+        assert_eq!(persist_remote_image(data.clone(), &store).await, data);
         let reference = "/media/abc.png".to_string();
-        assert_eq!(persist_remote_image(reference.clone()).await, reference);
+        assert_eq!(persist_remote_image(reference.clone(), &store).await, reference);
+        assert!(
+            recorder.saved.lock().unwrap().is_empty(),
+            "passthrough must not register media"
+        );
     }
 
     /// 回归（2026-09-29）：被触发门控丢弃的消息（群聊非 @我）**不得**预下载
@@ -1237,7 +1266,6 @@ mod tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _serial = MEDIA_ENV_LOCK.lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
@@ -1248,9 +1276,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = media_test_dir("gate-skip");
-        std::env::set_var("ECHO_MEDIA_DIR", &dir);
-        let handler = QqHandler::new(test_inner(QqTriggerConfig::default()));
+        let recorder = Arc::new(FakeMediaStore::default());
+        let inner = test_inner(QqTriggerConfig::default());
+        let store: Arc<dyn crate::media::MediaStore> = recorder.clone();
+        *inner.media_store.lock().unwrap() = Some(store);
+        let handler = QqHandler::new(inner);
         let (ctx, _rx) = test_ctx();
         let image_url = format!("{}/img.png", server.uri());
         assert_eq!(
@@ -1259,7 +1289,6 @@ mod tests {
                 .await,
             HandleResult::Pass
         );
-        std::env::remove_var("ECHO_MEDIA_DIR");
 
         let received = server.received_requests().await.unwrap_or_default();
         assert!(
@@ -1267,19 +1296,17 @@ mod tests {
             "gated-drop message must not fetch images: {received:?}"
         );
         assert!(
-            !dir.exists(),
-            "gated-drop message must not create media files"
+            recorder.saved.lock().unwrap().is_empty(),
+            "gated-drop message must not register media"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 门控与过滤通过的消息：图片在投递前落盘为 `/media/<id>` 引用。
+    /// 门控与过滤通过的消息：图片在投递前登记为 `/media/<id>` 引用。
     #[tokio::test]
     async fn delivered_message_persists_images_before_hook() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _serial = MEDIA_ENV_LOCK.lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/img.png"))
@@ -1291,10 +1318,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = media_test_dir("deliver-store");
-        std::env::set_var("ECHO_MEDIA_DIR", &dir);
+        let recorder = Arc::new(FakeMediaStore::default());
         let hook = Arc::new(MockHook::new(Ok(())));
         let inner = test_inner(QqTriggerConfig::default());
+        let store: Arc<dyn crate::media::MediaStore> = recorder.clone();
+        *inner.media_store.lock().unwrap() = Some(store);
         *inner.message_hook.lock().unwrap() = Some(hook.clone());
         let handler = QqHandler::new(inner);
         let (ctx, _rx) = test_ctx();
@@ -1304,22 +1332,17 @@ mod tests {
             handler.handle(&ctx, &private_image_event(&image_url)).await,
             HandleResult::Handled
         );
-        std::env::remove_var("ECHO_MEDIA_DIR");
 
         let messages = hook.messages.lock().unwrap();
         assert_eq!(messages.len(), 1, "hook receives the message");
         let images = &messages[0].images;
         assert_eq!(images.len(), 1);
-        assert!(
-            images[0].starts_with("/media/"),
-            "image must be persisted as a ref before delivery: {}",
-            images[0]
-        );
-        let id = echo_defs::media_store::id_of_ref(&images[0]).expect("valid ref");
         assert_eq!(
-            std::fs::read(dir.join(id)).expect("stored bytes"),
-            vec![9u8, 8, 7]
+            images[0], "/media/fake-0.png",
+            "image must be registered as a ref before delivery"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let saved = recorder.saved.lock().unwrap();
+        assert_eq!(saved[0].0, vec![9u8, 8, 7]);
+        assert_eq!(saved[0].1, "image/png");
     }
 }

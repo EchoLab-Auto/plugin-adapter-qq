@@ -101,14 +101,14 @@ impl QqAdapter {
 
     /// Set the path to the config file for persisting gate changes.
     pub fn set_config_path(&self, path: String) {
-        self.set_config_store(echo_adapter::ConfigStore::new(path));
+        self.set_config_store(crate::config_store::ConfigStore::new(path));
     }
 
-    /// Attach a shared [`echo_adapter::ConfigStore`] for gate/filter changes.
+    /// Attach a shared [`crate::config_store::ConfigStore`] for gate/filter changes.
     ///
     /// Sharing one store with the Agent guarantees concurrent TOML writes
     /// cannot lose each other's sections.
-    pub fn set_config_store(&self, store: echo_adapter::ConfigStore) {
+    pub fn set_config_store(&self, store: crate::config_store::ConfigStore) {
         *self.inner.config_store.lock().expect("poisoned") = Some(store);
     }
 
@@ -131,7 +131,7 @@ impl QqAdapter {
         };
 
         if let Err(e) = store.patch(|root| {
-            let qq = echo_adapter::ensure_table(echo_adapter::ensure_table(root, "adapters"), "qq");
+            let qq = crate::config_store::ensure_table(crate::config_store::ensure_table(root, "adapters"), "qq");
 
             qq.insert(
                 "gate".into(),
@@ -142,7 +142,7 @@ impl QqAdapter {
                 }),
             );
 
-            let filter = echo_adapter::ensure_table(qq, "filter");
+            let filter = crate::config_store::ensure_table(qq, "filter");
             // 白名单表是**整表替换**写入：`group_members_open` 必须随名单
             // 一起带回，否则用户设置的群成员放行开关会被 Panel 的任一名单
             // 编辑（UpdateQqAllowlist → persist）静默清掉。
@@ -200,7 +200,7 @@ impl QqAdapter {
             }
         };
         if let Err(e) = store.patch(|root| {
-            let qq = echo_adapter::ensure_table(echo_adapter::ensure_table(root, "adapters"), "qq");
+            let qq = crate::config_store::ensure_table(crate::config_store::ensure_table(root, "adapters"), "qq");
             qq.insert("owner_qq".into(), toml::Value::Integer(owner_qq));
             Ok(())
         }) {

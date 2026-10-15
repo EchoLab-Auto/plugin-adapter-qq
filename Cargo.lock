@@ -259,21 +259,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "echo-adapter"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "echo-defs",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
 name = "echo-adapter-qq"
 version = "0.1.0"
 dependencies = [
@@ -282,13 +267,11 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
- "echo-adapter",
  "echo-core",
- "echo-defs",
  "echo-plugin-sdk",
  "echo-server",
- "echo-test-utils",
  "futures-util",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -309,19 +292,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "echo-defs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -362,10 +332,6 @@ dependencies = [
  "tungstenite",
  "uuid",
 ]
-
-[[package]]
-name = "echo-test-utils"
-version = "0.1.0"
 
 [[package]]
 name = "equivalent"

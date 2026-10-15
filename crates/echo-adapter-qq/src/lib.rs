@@ -2,7 +2,7 @@
 //!
 //! Provides [`QqAdapter`] — a reverse-WebSocket server that bridges
 //! QQ messages (via NapCat / OneBot v11) into the agent framework as
-//! platform-agnostic [`IncomingMessage`](echo_adapter::IncomingMessage) values.
+//! platform-agnostic [`IncomingMessage`](crate::types::IncomingMessage) values.
 //!
 //! # Filter Pipeline
 //!
@@ -11,11 +11,15 @@
 
 pub mod adapter;
 pub mod config;
+pub mod config_store;
 pub mod file_bridge;
 pub mod files;
+pub mod filter;
 pub mod handler;
+pub mod media;
 pub mod napcat;
 pub mod plugin;
+pub mod types;
 
 pub use adapter::QqAdapter;
 pub use config::{QqAdapterConfig, QqFilterConfig, QqServerConfig, QqTriggerConfig};

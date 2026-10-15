@@ -4,9 +4,6 @@ members = [
     "crates/echo-core",
     "crates/echo-server",
     "crates/echo-adapter-qq",
-    "vendor/echo-adapter",
-    "vendor/echo-defs",
-    "vendor/echo-test-utils",
 ]
 
 [workspace.package]

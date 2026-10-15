@@ -1,4 +1,4 @@
-//! QQ/OneBot adapter — wraps echo-server and implements the Adapter trait.
+//! QQ/OneBot adapter — reverse-WS transport + gating/filter + outbound sends.
 //!
 //! Filter/gate management and TOML persistence live in `filter.rs`.
 
@@ -15,11 +15,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use echo_adapter::capabilities::AdapterManagement;
-use echo_adapter::filter::FilterPipeline;
-use echo_adapter::traits::{Adapter, AdapterConnectionState, AdapterError, AdapterInfo};
-use echo_adapter::types::{
-    AdapterEvent, ChannelType, IncomingFile, IncomingMessage, MessageTarget, SendResult,
+use crate::filter::FilterPipeline;
+use crate::types::{
+    AdapterConnectionState, AdapterError, AdapterEvent, AdapterInfo, ChannelType, IncomingFile,
+    InboundMessageHook, IncomingMessage, MessageTarget, SendResult,
 };
 use echo_core::{Event as OneBotEvent, MessageEvent, Segment};
 use echo_server::{ConnCallback, Context, HandlerRegistry, Server, ServerConfig};
@@ -89,7 +88,9 @@ pub(crate) struct QqInner {
     pub(crate) tracker: echo_server::ConnectionTracker,
     /// One-way inbound hook (set externally before start). Adapters depend
     /// only on echo-adapter abstractions, not on echo-agent itself.
-    pub(crate) message_hook: StdMutex<Option<Arc<dyn echo_adapter::InboundMessageHook>>>,
+    pub(crate) message_hook: StdMutex<Option<Arc<dyn InboundMessageHook>>>,
+    /// 宿主媒体登记通道（P1.7c：入站图片经宿主 `store_media` 登记）。
+    pub(crate) media_store: StdMutex<Option<Arc<dyn crate::media::MediaStore>>>,
     /// Extra handlers to register alongside the internal QQ handler.
     pub(crate) extra_handlers: StdMutex<Vec<Arc<dyn echo_server::Handler>>>,
     /// Runtime allowlist overrides (takes precedence over config file values).
@@ -104,7 +105,7 @@ pub(crate) struct QqInner {
     /// runtime via `set_owner_qq` (persisted through the ConfigStore).
     pub(crate) owner_qq: StdMutex<i64>,
     /// Shared config store for persisting gate/filter changes.
-    pub(crate) config_store: StdMutex<Option<echo_adapter::ConfigStore>>,
+    pub(crate) config_store: StdMutex<Option<crate::config_store::ConfigStore>>,
     /// Resolves local file paths into paths/URLs visible to NapCat, so
     /// `send_file` works even when the agent and NapCat are on different
     /// hosts (agent on host, NapCat in Docker).
@@ -197,6 +198,7 @@ impl QqAdapter {
                 napcat_config_task: StdMutex::new(None),
                 tracker: echo_server::ConnectionTracker::default(),
                 message_hook: StdMutex::new(None),
+                media_store: StdMutex::new(None),
                 extra_handlers: StdMutex::new(Vec::new()),
                 runtime_allowlist_users: StdMutex::new(au),
                 runtime_allowlist_groups: StdMutex::new(ag),
@@ -328,7 +330,7 @@ impl QqAdapter {
     }
 
     /// Attach the one-way inbound hook before starting the adapter.
-    pub fn set_message_hook(&self, hook: Arc<dyn echo_adapter::InboundMessageHook>) {
+    pub fn set_message_hook(&self, hook: Arc<dyn InboundMessageHook>) {
         *self
             .inner
             .message_hook
@@ -338,12 +340,21 @@ impl QqAdapter {
 
     /// 当前消息钩子（插件入口测试 / 集成自检：入站与连接态经它回调）。
     #[allow(dead_code)]
-    pub(crate) fn message_hook(&self) -> Option<Arc<dyn echo_adapter::InboundMessageHook>> {
+    pub(crate) fn message_hook(&self) -> Option<Arc<dyn InboundMessageHook>> {
         self.inner
             .message_hook
             .lock()
             .expect("message hook poisoned")
             .clone()
+    }
+
+    /// 注入宿主媒体登记通道（插件入口在握手完成后调用；入站图片经它登记）。
+    pub(crate) fn set_media_store(&self, store: Arc<dyn crate::media::MediaStore>) {
+        *self
+            .inner
+            .media_store
+            .lock()
+            .expect("media store poisoned") = Some(store);
     }
 
     /// Register an additional handler (e.g. Echo, Help, Admin).
@@ -788,25 +799,24 @@ impl QqAdapter {
     }
 }
 
-#[async_trait]
-impl Adapter for QqAdapter {
-    fn name(&self) -> &str {
+impl QqAdapter {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    fn display_name(&self) -> &str {
+    pub fn display_name(&self) -> &str {
         &self.inner.display_name
     }
 
-    fn platform(&self) -> &str {
+    pub fn platform(&self) -> &str {
         "qq"
     }
 
-    fn is_configured(&self) -> bool {
+    pub fn is_configured(&self) -> bool {
         !self.inner.config.server.bind_address.is_empty()
     }
 
-    fn status_info(&self) -> AdapterInfo {
+    pub fn status_info(&self) -> AdapterInfo {
         let connected = self.inner.connected.load(Ordering::SeqCst);
         let running = self.inner.running.load(Ordering::SeqCst);
         AdapterInfo {
@@ -830,7 +840,7 @@ impl Adapter for QqAdapter {
         }
     }
 
-    async fn start(&self) -> Result<(), AdapterError> {
+    pub async fn start(&self) -> Result<(), AdapterError> {
         if self.inner.running.load(Ordering::SeqCst) {
             return Err(AdapterError::AlreadyRunning("qq".into()));
         }
@@ -979,7 +989,7 @@ impl Adapter for QqAdapter {
         Ok(())
     }
 
-    async fn remove_instance(&self) -> Result<(), AdapterError> {
+    pub async fn remove_instance(&self) -> Result<(), AdapterError> {
         // 先停（保留 stop 的全部清理语义；未运行时不报错——remove 幂等）。
         if self.inner.running.load(Ordering::SeqCst) {
             self.stop().await?;
@@ -994,7 +1004,7 @@ impl Adapter for QqAdapter {
         Ok(())
     }
 
-    async fn stop(&self) -> Result<(), AdapterError> {
+    pub async fn stop(&self) -> Result<(), AdapterError> {
         if !self.inner.running.load(Ordering::SeqCst) {
             return Err(AdapterError::NotRunning("qq".into()));
         }
@@ -1054,7 +1064,7 @@ impl Adapter for QqAdapter {
         Ok(())
     }
 
-    async fn send_message(
+    pub async fn send_message(
         &self,
         target: &MessageTarget,
         content: &str,
@@ -1140,15 +1150,10 @@ impl Adapter for QqAdapter {
         }
     }
 
-    fn subscribe(&self, tx: mpsc::UnboundedSender<AdapterEvent>) {
+    pub fn subscribe(&self, tx: mpsc::UnboundedSender<AdapterEvent>) {
         if let Ok(mut subs) = self.inner.subscribers.lock() {
             subs.push(tx);
         }
-    }
-
-    fn management(&self) -> Option<&dyn AdapterManagement> {
-        // 平台中立管理面（W3.2，2026-10 适配器管理通道）：QQ 适配器恒实现。
-        Some(self)
     }
 }
 
@@ -1197,9 +1202,8 @@ impl QqAdapter {
 /// - `invoke_custom`：method 路由表（方法名与线协议 `InvokeAdapterOp` /
 ///   插件协议 `custom op` 同名直通）。写路径内部仍走既有固有 setter
 ///   （管道重建 + ConfigStore 持久化语义不变）。
-#[async_trait]
-impl AdapterManagement for QqAdapter {
-    fn cached_state(&self) -> Option<Value> {
+impl QqAdapter {
+    pub fn cached_state(&self) -> Option<Value> {
         let cfg = self.get_filter_config();
         let mode = gate_mode_str(self.get_gate_mode());
         Some(json!({
@@ -1224,7 +1228,7 @@ impl AdapterManagement for QqAdapter {
         }))
     }
 
-    async fn invoke_custom(&self, method: &str, payload: Value) -> Result<Value, AdapterError> {
+    pub async fn invoke_custom(&self, method: &str, payload: Value) -> Result<Value, AdapterError> {
         match method {
             "set_gate_mode" => {
                 let mode = match payload.get("mode").and_then(Value::as_str) {
@@ -1396,15 +1400,12 @@ mod tests {
             QqAdapter::with_instance("alix-two", Some("alix".into()), QqAdapterConfig::default());
         assert_eq!(multi.status_info().display_name, "QQ（alix / alix-two）");
         // 实例附加信息经管理面 `cached_state` 取（W3.2 适配器管理通道）。
-        let state = multi
-            .management()
-            .and_then(|m| m.cached_state())
-            .expect("cached state");
+        let state = multi.cached_state().expect("cached state");
         assert_eq!(state["instance"]["persona"], json!("alix"));
     }
 
-    /// 管理面契约（2026-10 适配器管理通道）：QQ 适配器必须暴露
-    /// `AdapterManagement`，`cached_state` 反映实例配置，且管理面与固有
+    /// 管理面契约（2026-10 适配器管理通道）：`cached_state` 反映实例配置，
+    /// 且管理面（cached_state / invoke_custom）与固有
     /// 方法操作同一份状态。
     #[tokio::test]
     async fn qq_adapter_exposes_management_capability() {
@@ -1413,9 +1414,7 @@ mod tests {
             ..Default::default()
         };
         let adapter = QqAdapter::with_instance("alix-two", Some("alix".into()), cfg);
-        let management = adapter
-            .management()
-            .expect("QQ 适配器必须暴露 AdapterManagement 能力");
+        let management = &adapter;
         let state = management.cached_state().expect("cached state");
         assert_eq!(state["instance"]["persona"], json!("alix"));
         assert_eq!(state["instance"]["container"], json!("napcat-x"));
@@ -1440,7 +1439,7 @@ mod tests {
     }
 
     /// 平台中立管理面契约（W3.2，2026-10 适配器管理通道）：
-    /// `management()` 恒定 Some；`cached_state` 同步投影与写入后状态一致；
+    /// `cached_state` 同步投影与写入后状态一致；
     /// `invoke_custom` method 路由表（含可读错误）与双管理面同源。
     #[tokio::test]
     async fn qq_adapter_exposes_platform_neutral_management() {
@@ -1449,9 +1448,7 @@ mod tests {
             ..Default::default()
         };
         let adapter = QqAdapter::with_instance("alix-mgmt", Some("alix".into()), cfg);
-        let management = adapter
-            .management()
-            .expect("QQ 适配器必须暴露 AdapterManagement 管理面");
+        let management = &adapter;
 
         // cached_state：实例信息 + 门控 + owner 快照（零 IO）。
         let state = management.cached_state().expect("state snapshot");
@@ -1842,9 +1839,9 @@ mod tests {
         // Ok 包装里的 "wrong adapter"。
         let own = adapter
             .send_message(
-                &echo_defs::chat::MessageTarget {
+                &crate::types::MessageTarget {
                     adapter_name: "alix-two".into(),
-                    channel: echo_defs::chat::ChannelType::Direct,
+                    channel: crate::types::ChannelType::Direct,
                     user_id: "10001".into(),
                 },
                 "ping",
@@ -1868,9 +1865,9 @@ mod tests {
         }
         let other = adapter
             .send_message(
-                &echo_defs::chat::MessageTarget {
+                &crate::types::MessageTarget {
                     adapter_name: "qq".into(),
-                    channel: echo_defs::chat::ChannelType::Direct,
+                    channel: crate::types::ChannelType::Direct,
                     user_id: "10001".into(),
                 },
                 "ping",
@@ -1935,9 +1932,9 @@ mod tests {
         // 非本实例名 → 拒绝（success=false，错误带 wrong adapter）。
         let wrong = adapter
             .send_voice(
-                &echo_defs::chat::MessageTarget {
+                &crate::types::MessageTarget {
                     adapter_name: "qq".into(),
-                    channel: echo_defs::chat::ChannelType::Direct,
+                    channel: crate::types::ChannelType::Direct,
                     user_id: "10001".into(),
                 },
                 "x.mp3",
@@ -1950,9 +1947,9 @@ mod tests {
         // 本实例 + 空 file：解析期即拒绝（success=false，不 panic）。
         let empty = adapter
             .send_voice(
-                &echo_defs::chat::MessageTarget {
+                &crate::types::MessageTarget {
                     adapter_name: "alix-two".into(),
-                    channel: echo_defs::chat::ChannelType::Direct,
+                    channel: crate::types::ChannelType::Direct,
                     user_id: "10001".into(),
                 },
                 "   ",
@@ -1964,9 +1961,9 @@ mod tests {
         // 本实例 + 合法 file：无连接时错误绝不能是 "wrong adapter"。
         let own = adapter
             .send_voice(
-                &echo_defs::chat::MessageTarget {
+                &crate::types::MessageTarget {
                     adapter_name: "alix-two".into(),
-                    channel: echo_defs::chat::ChannelType::Direct,
+                    channel: crate::types::ChannelType::Direct,
                     user_id: "10001".into(),
                 },
                 "https://example.com/voice.mp3",
@@ -1997,9 +1994,9 @@ mod tests {
         cfg.filter.allowlist.user_ids = vec![10001];
         let adapter = QqAdapter::with_instance("qq", None, cfg);
         // 出站门控（同步，与入站管道共享同一份 runtime 配置）：10002 被白名单拦
-        let blocked = echo_defs::chat::MessageTarget {
+        let blocked = crate::types::MessageTarget {
             adapter_name: "qq".into(),
-            channel: echo_defs::chat::ChannelType::Direct,
+            channel: crate::types::ChannelType::Direct,
             user_id: "10002".into(),
         };
         assert!(

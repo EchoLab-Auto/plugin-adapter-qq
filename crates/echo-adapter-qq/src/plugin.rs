@@ -28,9 +28,10 @@ use echo_plugin_sdk::echo_plugin_api::{
 use echo_plugin_sdk::{AdapterPlugin, HostCallError, HostClient};
 use serde_json::{json, Value};
 
-use echo_adapter::types::{ChannelType, IncomingMessage, MessageTarget};
-use echo_adapter::{
-    Adapter, AdapterConnectionState, AdapterManagement, ConfigStore, InboundMessageHook,
+use crate::config_store::ConfigStore;
+use crate::media::MediaStore;
+use crate::types::{
+    AdapterConnectionState, ChannelType, IncomingMessage, InboundMessageHook, MessageTarget,
 };
 
 use crate::adapter::qq::DEFAULT_INSTANCE_NAME;
@@ -202,6 +203,10 @@ impl AdapterPlugin for QqPlugin {
                 adapter: adapter.name().to_string(),
             });
             adapter.set_message_hook(bridge);
+            // 入站图片登记走宿主媒体库（`store_media`）。
+            adapter.set_media_store(Arc::new(HostMediaStore {
+                host: host.clone(),
+            }));
         } else {
             tracing::warn!("qq plugin on_ready before configure; inbound bridge not installed");
         }
@@ -263,6 +268,41 @@ impl InboundMessageHook for HostBridge {
                 tracing::debug!(error = %e, "report_state host call failed");
             }
         });
+    }
+}
+
+/// 媒体登记通道：图片字节写临时文件 → 宿主 `adapter_host.store_media`
+/// （同机传 path，字节不过协议帧；见 `document/adapter-plugin.md` §安全边界）。
+struct HostMediaStore {
+    host: HostClient,
+}
+
+#[echo_plugin_sdk::async_trait]
+impl MediaStore for HostMediaStore {
+    async fn store_image(&self, bytes: &[u8], mime: &str) -> Result<String, String> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "echo-qq-media-{}-{seq}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).map_err(|e| format!("write temp media: {e}"))?;
+        let result = self
+            .host
+            .call(
+                ADAPTER_HOST_SERVICE,
+                "store_media",
+                json!({"path": path.to_string_lossy(), "mime": mime}),
+            )
+            .await;
+        // 不论成败都清理临时文件；宿主在该调用返回前已读完。
+        let _ = std::fs::remove_file(&path);
+        let value = result.map_err(|e| e.to_string())?;
+        value
+            .get("ref")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("store_media returned no ref: {value}"))
     }
 }
 
@@ -569,7 +609,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use echo_adapter::types::IncomingFile;
+    use crate::types::IncomingFile;
     use echo_plugin_sdk::echo_plugin_api::{
         Contribution, Hello, HostCallOutcome, HostCallResult, HostToPlugin, Invoke, PluginToHost,
         PROTOCOL_NAME, PROTOCOL_VERSION,
@@ -953,6 +993,57 @@ mod tests {
         assert_eq!(gate["mode"], json!("none"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `HostMediaStore`：字节写临时文件 → `store_media` 回呼（宿主读到原字节）
+    /// → 返回引用 + 临时文件清理。
+    #[tokio::test]
+    async fn host_media_store_writes_temp_file_and_cleans_up() {
+        let (mut host, plugin) = FakeHost::start(QqPlugin::new());
+        host.handshake(json!({"name": "qq-test"}), "qq-test").await;
+
+        let store = HostMediaStore {
+            host: plugin.host_handle().expect("host client installed by on_ready"),
+        };
+        let store_task = tokio::spawn(async move {
+            let bytes = vec![1u8, 2, 3];
+            store.store_image(&bytes, "image/png").await
+        });
+
+        // 宿主侧读到临时文件的原字节后回执引用。
+        let temp_path = match host.recv().await {
+            PluginToHost::HostCall(call) => {
+                assert_eq!(call.service, "adapter_host");
+                assert_eq!(call.method, "store_media");
+                assert_eq!(call.payload["mime"], json!("image/png"));
+                let path = call.payload["path"].as_str().expect("path").to_string();
+                assert_eq!(std::fs::read(&path).expect("host reads temp file"), vec![1u8, 2, 3]);
+                host.send(&HostToPlugin::HostCallResult(HostCallResult {
+                    call_id: call.call_id.clone(),
+                    outcome: HostCallOutcome::Ok {
+                        result: json!({"ref": "/media/abc.png"}),
+                    },
+                }))
+                .await;
+                path
+            }
+            other => panic!("expected HostCall, got {other:?}"),
+        };
+
+        let reference = store_task
+            .await
+            .expect("join")
+            .expect("store_media succeeds");
+        assert_eq!(reference, "/media/abc.png");
+        // 调用返回后临时文件已清理。
+        assert!(
+            !std::path::Path::new(&temp_path).exists(),
+            "temp file must be removed after store_media returns"
+        );
+
+        let FakeHost { stream, session } = host;
+        drop(stream);
+        let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
     }
 
     /// `Hello.config` 非法 → `Failed{invalid_config}`，会话以错误退出。

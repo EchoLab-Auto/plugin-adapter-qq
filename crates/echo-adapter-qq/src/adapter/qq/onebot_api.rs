@@ -341,9 +341,9 @@ impl QqAdapter {
         // 出站门控（2026-10 巡检 P1）：文件上传此前绕开
         // check_outbound_gate——send_message/send_json_card 都过门控，
         // upload 不应是后门。构造等效 MessageTarget 复用同一门控。
-        let target = echo_defs::chat::MessageTarget {
+        let target = crate::types::MessageTarget {
             adapter_name: self.name.clone(),
-            channel: echo_defs::chat::ChannelType::Group {
+            channel: crate::types::ChannelType::Group {
                 group_id: group_id.to_string(),
             },
             user_id: String::new(),
@@ -393,9 +393,9 @@ impl QqAdapter {
         file_name: &str,
     ) -> Result<String, String> {
         // 出站门控（同 upload_group_file 注释）。
-        let target = echo_defs::chat::MessageTarget {
+        let target = crate::types::MessageTarget {
             adapter_name: self.name.clone(),
-            channel: echo_defs::chat::ChannelType::Direct,
+            channel: crate::types::ChannelType::Direct,
             user_id: user_id.to_string(),
         };
         self.check_outbound_gate(&target)?;

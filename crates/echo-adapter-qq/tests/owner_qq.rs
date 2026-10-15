@@ -1,5 +1,7 @@
 //! QQ owner (admin) runtime update and persistence.
 
+mod common;
+
 use echo_adapter_qq::config::QqAdapterConfig;
 use echo_adapter_qq::QqAdapter;
 
@@ -29,7 +31,7 @@ fn set_owner_qq_zero_clears_owner() {
 
 #[test]
 fn set_owner_qq_persists_through_config_store() {
-    let file = echo_test_utils::temp_config_file(
+    let file = common::temp_config_file(
         "owner-qq",
         "[adapters.qq]\nenabled = false\nowner_qq = 0\n",
     );
@@ -38,7 +40,7 @@ fn set_owner_qq_persists_through_config_store() {
         ..Default::default()
     };
     let adapter = QqAdapter::new(config);
-    adapter.set_config_store(echo_adapter::ConfigStore::new(file.path().to_path_buf()));
+    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(file.path().to_path_buf()));
     adapter.set_owner_qq(777);
 
     // The runtime value is updated immediately.
