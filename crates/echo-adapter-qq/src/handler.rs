@@ -97,6 +97,7 @@ impl echo_server::Handler for QqHandler {
                 }
             }
             self.resolve_pending_files(&mut file_msg).await;
+            self.annotate_sender_role(&mut file_msg);
             tracing::info!(
                 user = %file_msg.user_id,
                 channel = %file_msg.channel,
@@ -171,6 +172,7 @@ impl echo_server::Handler for QqHandler {
         // 私聊文件（消息 file 段）：在过滤通过后下载，避免被拦截的消息
         // 白白拉取大文件。
         self.resolve_pending_files(&mut msg).await;
+        self.annotate_sender_role(&mut msg);
 
         tracing::info!(
             user = %msg.user_id,
@@ -365,6 +367,26 @@ impl QqHandler {
                 msg.content.push('\n');
                 msg.content.push_str(&note);
             }
+        }
+    }
+
+    /// 标注发送者角色（`metadata.sender_role`）。
+    ///
+    /// 宿主命令域（`/status`、`/shutdown` 等管理员命令）只认该标注判定
+    /// owner（信任边界 = 插件为用户自装的可信代码；宿主不重复读平台配置）。
+    fn annotate_sender_role(&self, msg: &mut IncomingMessage) {
+        let owner = *self.inner.owner_qq.lock().expect("owner poisoned");
+        if owner <= 0 || msg.user_id != owner.to_string() {
+            return;
+        }
+        if !msg.metadata.is_object() {
+            msg.metadata = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(obj) = msg.metadata.as_object_mut() {
+            obj.insert(
+                "sender_role".to_string(),
+                serde_json::Value::String("owner".to_string()),
+            );
         }
     }
 
@@ -1153,6 +1175,54 @@ mod tests {
             HandleResult::Handled
         );
         assert!(api_rx.try_recv().is_err(), "hook errors must stay internal");
+    }
+
+    /// 发送者角色标注（宿主命令域 admin 判定）：owner → `metadata.sender_role`。
+    #[tokio::test]
+    async fn owner_message_carries_sender_role_annotation() {
+        let inner = test_inner(QqTriggerConfig::default());
+        *inner.owner_qq.lock().unwrap() = 123456;
+        let hook = Arc::new(MockHook::new(Ok(())));
+        *inner.message_hook.lock().unwrap() = Some(hook.clone());
+        let handler = QqHandler::new(inner);
+        let (ctx, _rx) = test_ctx();
+
+        // owner 消息：标注 sender_role=owner。
+        assert_eq!(
+            handler.handle(&ctx, &private_event("hello")).await,
+            HandleResult::Handled
+        );
+        {
+            let messages = hook.messages.lock().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages[0].metadata["sender_role"],
+                serde_json::json!("owner")
+            );
+        }
+
+        // 非 owner 消息：不标注（metadata 保持原样，不含 sender_role）。
+        let event = serde_json::from_value(serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "time": 1700000000,
+            "self_id": 10001,
+            "sub_type": "friend",
+            "message_id": 43,
+            "user_id": 999,
+            "message": [{"type": "text", "data": {"text": "hi"}}],
+            "raw_message": "hi",
+            "font": 0,
+            "sender": {"user_id": 999, "nickname": "other"}
+        }))
+        .unwrap();
+        assert_eq!(
+            handler.handle(&ctx, &event).await,
+            HandleResult::Handled
+        );
+        let messages = hook.messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].metadata.get("sender_role").is_none());
     }
 
     #[tokio::test]
