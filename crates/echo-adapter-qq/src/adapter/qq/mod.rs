@@ -357,6 +357,44 @@ impl QqAdapter {
             .expect("media store poisoned") = Some(store);
     }
 
+    /// 从管理方法载荷解析出站目标
+    /// （`{target: {channel: {type: "dm"|"group", group_id?}, user_id?}}`）。
+    fn parse_target_payload(&self, payload: &Value) -> Result<MessageTarget, AdapterError> {
+        let target = payload
+            .get("target")
+            .ok_or_else(|| AdapterError::Internal("target required".into()))?;
+        let channel_json = &target["channel"];
+        let channel = match channel_json.get("type").and_then(Value::as_str) {
+            Some("dm") => ChannelType::Direct,
+            Some("group") => {
+                let group_id = channel_json
+                    .get("group_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AdapterError::Internal("group target requires group_id".into())
+                    })?;
+                ChannelType::Group {
+                    group_id: group_id.to_string(),
+                }
+            }
+            other => {
+                return Err(AdapterError::Internal(format!(
+                    "unknown channel type {other:?} (expected dm|group)"
+                )))
+            }
+        };
+        let user_id = target
+            .get("user_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(MessageTarget {
+            adapter_name: self.name.clone(),
+            channel,
+            user_id,
+        })
+    }
+
     /// Register an additional handler (e.g. Echo, Help, Admin).
     pub fn add_handler(&self, handler: Box<dyn echo_server::Handler>) {
         self.inner
@@ -1306,6 +1344,106 @@ impl QqAdapter {
                 "onebot_url": self.inner.config.napcat_onebot_url.clone(),
                 "bind_address": self.inner.config.server.bind_address.clone(),
             })),
+            // ── 出站消息（宿主 QQ 工具经自定义方法路由；send_text 走
+            //    `Adapter::send_message`，此处补卡片 / 语音 / 图片 / 文件）──
+            "send_json_card" => {
+                let target = self.parse_target_payload(&payload)?;
+                let json_payload = payload
+                    .get("json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AdapterError::Internal("json required".into()))?;
+                let result = self
+                    .send_json_card(&target, json_payload)
+                    .await
+                    .map_err(|e| AdapterError::Internal(e.to_string()))?;
+                Ok(send_result_json(result))
+            }
+            "send_voice" => {
+                let target = self.parse_target_payload(&payload)?;
+                let file = payload
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AdapterError::Internal("file required".into()))?;
+                let result = self
+                    .send_voice(&target, file)
+                    .await
+                    .map_err(|e| AdapterError::Internal(e.to_string()))?;
+                Ok(send_result_json(result))
+            }
+            "send_image" => {
+                let target = self.parse_target_payload(&payload)?;
+                let image = payload
+                    .get("image")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AdapterError::Internal("image required".into()))?;
+                let result = self
+                    .send_image(&target, image)
+                    .await
+                    .map_err(|e| AdapterError::Internal(e.to_string()))?;
+                Ok(send_result_json(result))
+            }
+            "send_file" => {
+                let target = self.parse_target_payload(&payload)?;
+                let file_path = payload
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AdapterError::Internal("file_path required".into()))?;
+                let file_name = payload
+                    .get("file_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AdapterError::Internal("file_name required".into()))?;
+                let detail = match &target.channel {
+                    ChannelType::Direct => {
+                        let user_id = target
+                            .user_id
+                            .parse::<i64>()
+                            .map_err(|_| AdapterError::Internal("invalid user_id".into()))?;
+                        self.upload_private_file(user_id, file_path, file_name)
+                            .await
+                            .map_err(AdapterError::Internal)?
+                    }
+                    ChannelType::Group { group_id } => {
+                        let group_id = group_id
+                            .parse::<i64>()
+                            .map_err(|_| AdapterError::Internal("invalid group_id".into()))?;
+                        self.upload_group_file(group_id, file_path, file_name)
+                            .await
+                            .map_err(AdapterError::Internal)?
+                    }
+                };
+                Ok(Value::String(detail))
+            }
+            // ── 目录 / 历史（宿主 QQ 工具的门控可见版本）──
+            "get_group_list" => {
+                let groups = self.get_group_list().await.map_err(AdapterError::Internal)?;
+                Ok(json!({"groups": id_name_pairs(groups)}))
+            }
+            "get_gated_friend_list" => {
+                let friends = self
+                    .get_gated_friend_list()
+                    .await
+                    .map_err(AdapterError::Internal)?;
+                Ok(json!({"friends": id_name_pairs(friends)}))
+            }
+            "get_group_member_info" => {
+                let group_id = parse_id(&payload, "group_id")?;
+                let user_id = parse_id(&payload, "user_id")?;
+                let info = self
+                    .get_group_member_info(group_id, user_id)
+                    .await
+                    .map_err(AdapterError::Internal)?;
+                Ok(Value::String(info))
+            }
+            "get_group_msg_history" => {
+                let group_id = parse_id(&payload, "group_id")?;
+                let count = payload.get("count").and_then(Value::as_i64).unwrap_or(50);
+                let since_minutes = payload.get("since_minutes").and_then(Value::as_u64);
+                let transcript = self
+                    .get_group_msg_history(group_id, count, since_minutes)
+                    .await
+                    .map_err(AdapterError::Internal)?;
+                Ok(Value::String(transcript))
+            }
             other => Err(AdapterError::Internal(format!(
                 "unknown adapter method: {other}"
             ))),
@@ -1367,6 +1505,15 @@ fn parse_id(payload: &Value, key: &str) -> Result<i64, AdapterError> {
     Err(AdapterError::Internal(format!("{key}: invalid id {value}")))
 }
 
+/// [`SendResult`] → 线格式 JSON（管理方法路由与插件 custom op 的返回承载）。
+fn send_result_json(result: SendResult) -> Value {
+    json!({
+        "message_id": result.message_id,
+        "success": result.success,
+        "error": result.error,
+    })
+}
+
 /// `(id, name)` 列表 → `[{id, name}]`（id 字符串化）。
 fn id_name_pairs(items: Vec<(i64, String)>) -> Vec<Value> {
     items
@@ -1402,6 +1549,81 @@ mod tests {
         // 实例附加信息经管理面 `cached_state` 取（W3.2 适配器管理通道）。
         let state = multi.cached_state().expect("cached state");
         assert_eq!(state["instance"]["persona"], json!("alix"));
+    }
+
+    /// 宿主工具方法契约（P1.8）：`custom` 方法表覆盖 qq_tools 的出站 / 目录 /
+    /// 历史路径——参数校验与无连接错误均为可读 `AdapterError`（不 panic）。
+    #[tokio::test]
+    async fn custom_op_covers_host_tool_methods() {
+        let adapter = QqAdapter::new(QqAdapterConfig::default());
+
+        // 缺 target → 可读错误。
+        let err = adapter
+            .invoke_custom("send_json_card", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("target required"), "{err}");
+
+        // send_image：目标合法但无 QQ 连接 → send_failed 语义的可读错误。
+        let target = json!({"channel": {"type": "dm"}, "user_id": "1"});
+        let err = adapter
+            .invoke_custom(
+                "send_image",
+                json!({"target": target, "image": "http://example.invalid/x.png"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no QQ connection"), "{err}");
+
+        // send_voice / send_file：缺载荷字段 → 可读错误。
+        let err = adapter
+            .invoke_custom("send_voice", json!({"target": target}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("file required"), "{err}");
+        let err = adapter
+            .invoke_custom("send_file", json!({"target": target}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("file_path required"), "{err}");
+
+        // 目录 / 历史方法：无连接 → 可读错误（未启动 / 无活动连接两种文案
+        // 都属预期；参数校验先行）。
+        let err = adapter
+            .invoke_custom("get_group_list", json!({}))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("no QQ connection") || message.contains("未启动"),
+            "{message}"
+        );
+        let err = adapter
+            .invoke_custom("get_gated_friend_list", json!({}))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("no QQ connection") || message.contains("未启动"),
+            "{message}"
+        );
+        let err = adapter
+            .invoke_custom("get_group_member_info", json!({"group_id": "1"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("user_id"), "{err}");
+        let err = adapter
+            .invoke_custom("get_group_msg_history", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("group_id"), "{err}");
+
+        // 未知方法仍是可读错误（方法表尾兜底）。
+        let err = adapter
+            .invoke_custom("definitely_not_a_method", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown adapter method"), "{err}");
     }
 
     /// 管理面契约（2026-10 适配器管理通道）：`cached_state` 反映实例配置，

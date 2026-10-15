@@ -79,6 +79,35 @@ impl QqPlugin {
     pub fn host_handle(&self) -> Option<HostClient> {
         self.state.host.get().cloned()
     }
+
+    /// 推送管理面状态快照（`adapter_host.report_ui_state`）——宿主缓存据此
+    /// 服务管理读路径（`cached_state`）与 Panel 状态卡。
+    ///
+    /// fire-and-forget：调用点不等待（回执失败只记 debug）。
+    fn push_ui_state(&self) {
+        let (Some(host), Some(adapter)) = (
+            self.state.host.get().cloned(),
+            self.state.adapter.get().cloned(),
+        ) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(state) = adapter.cached_state() else {
+                return;
+            };
+            let name = adapter.name().to_string();
+            if let Err(e) = host
+                .call(
+                    ADAPTER_HOST_SERVICE,
+                    "report_ui_state",
+                    json!({"adapter": name, "state": state}),
+                )
+                .await
+            {
+                tracing::debug!(error = %e, "report_ui_state host call failed");
+            }
+        });
+    }
 }
 
 impl Default for QqPlugin {
@@ -166,11 +195,17 @@ impl AdapterPlugin for QqPlugin {
         };
         match op {
             "start" => match adapter.start().await {
-                Ok(()) => ok_result(json!({})),
+                Ok(()) => {
+                    self.push_ui_state();
+                    ok_result(json!({}))
+                }
                 Err(e) => error_outcome("adapter_error", e.to_string()),
             },
             "stop" => match adapter.stop().await {
-                Ok(()) => ok_result(json!({})),
+                Ok(()) => {
+                    self.push_ui_state();
+                    ok_result(json!({}))
+                }
                 Err(e) => error_outcome("adapter_error", e.to_string()),
             },
             "status" => {
@@ -189,7 +224,10 @@ impl AdapterPlugin for QqPlugin {
                     return error_outcome("invalid_payload", "custom requires `method`");
                 };
                 let inner = payload.get("payload").cloned().unwrap_or(Value::Null);
-                custom_op(&adapter, method, inner).await
+                let outcome = custom_op(&adapter, method, inner).await;
+                // 管理面状态可能已变（写方法）：推送快照，宿主缓存随之刷新。
+                self.push_ui_state();
+                outcome
             }
             other => error_outcome("unknown_op", format!("unknown adapter op: {other}")),
         }
@@ -201,6 +239,7 @@ impl AdapterPlugin for QqPlugin {
             let bridge = Arc::new(HostBridge {
                 host: host.clone(),
                 adapter: adapter.name().to_string(),
+                qq: adapter.clone(),
             });
             adapter.set_message_hook(bridge);
             // 入站图片登记走宿主媒体库（`store_media`）。
@@ -211,6 +250,8 @@ impl AdapterPlugin for QqPlugin {
             tracing::warn!("qq plugin on_ready before configure; inbound bridge not installed");
         }
         let _ = self.state.host.set(host);
+        // 初始状态快照（宿主管理读路径在首次操作前即可用）。
+        self.push_ui_state();
     }
 
     async fn on_drain(&self, _deadline_ms: u64) {
@@ -228,6 +269,8 @@ impl AdapterPlugin for QqPlugin {
 struct HostBridge {
     host: HostClient,
     adapter: String,
+    /// 适配器句柄：连接态变化后顺带推送管理面状态快照。
+    qq: Arc<QqAdapter>,
 }
 
 #[echo_plugin_sdk::async_trait]
@@ -258,6 +301,7 @@ impl InboundMessageHook for HostBridge {
         // 同步钩子：spawn 后台任务上报（宿主侧只更新缓存，不需要回执等待）。
         let host = self.host.clone();
         let adapter = self.adapter.clone();
+        let qq = self.qq.clone();
         tokio::spawn(async move {
             let payload = json!({
                 "adapter": adapter,
@@ -266,6 +310,21 @@ impl InboundMessageHook for HostBridge {
             });
             if let Err(e) = host.call(ADAPTER_HOST_SERVICE, "report_state", payload).await {
                 tracing::debug!(error = %e, "report_state host call failed");
+            }
+            // 连接态变化影响 `cached_state`（online / self_id）：刷新快照。
+            let Some(state) = qq.cached_state() else {
+                return;
+            };
+            let name = qq.name().to_string();
+            if let Err(e) = host
+                .call(
+                    ADAPTER_HOST_SERVICE,
+                    "report_ui_state",
+                    json!({"adapter": name, "state": state}),
+                )
+                .await
+            {
+                tracing::debug!(error = %e, "report_ui_state host call failed");
             }
         });
     }
@@ -701,9 +760,17 @@ mod tests {
                 other => panic!("expected Register, got {other:?}"),
             }
             assert_eq!(self.recv().await, PluginToHost::Ready);
+            // `on_ready` 已完成：初始管理面状态快照（`report_ui_state`）是
+            // Ready 之后的第一帧（单写者保证顺序）。回执它，保持测试确定。
+            let payload = self.answer_host_call("report_ui_state").await;
+            assert_eq!(payload["adapter"], json!(expected_adapter));
+            assert!(
+                payload["state"]["instance"].is_object(),
+                "ui state snapshot should carry instance info: {payload}"
+            );
         }
 
-        /// 发一个 Invoke 并读回结果。
+        /// 发一个 Invoke 并读回结果（自动回执穿插的 HostCall——状态推送等）。
         async fn invoke(&mut self, contribution: &str, payload: Value) -> InvokeOutcome {
             self.send(&HostToPlugin::Invoke(Invoke {
                 call_id: format!("test:{contribution}"),
@@ -712,29 +779,44 @@ mod tests {
                 payload,
             }))
             .await;
-            match self.recv().await {
-                PluginToHost::InvokeResult(result) => result.outcome,
-                other => panic!("expected InvokeResult, got {other:?}"),
+            for _ in 0..8 {
+                match self.recv().await {
+                    PluginToHost::HostCall(call) => self.answer(call).await,
+                    PluginToHost::InvokeResult(result) => return result.outcome,
+                    other => panic!("expected InvokeResult, got {other:?}"),
+                }
             }
+            panic!("too many interleaved host calls before InvokeResult");
         }
 
-        /// 读一个插件发出的 HostCall 并回执。
+        /// 回执一个 HostCall（测试侧统一接受）。
+        async fn answer(&mut self, call: echo_plugin_sdk::echo_plugin_api::HostCall) {
+            assert_eq!(call.service, "adapter_host");
+            self.send(&HostToPlugin::HostCallResult(HostCallResult {
+                call_id: call.call_id.clone(),
+                outcome: HostCallOutcome::Ok {
+                    result: json!({"accepted": true}),
+                },
+            }))
+            .await;
+        }
+
+        /// 读一个插件发出的 HostCall 并回执（跳过并回执不匹配的前置调用）。
         async fn answer_host_call(&mut self, expected_method: &str) -> Value {
-            match self.recv().await {
-                PluginToHost::HostCall(call) => {
-                    assert_eq!(call.service, "adapter_host");
-                    assert_eq!(call.method, expected_method);
-                    self.send(&HostToPlugin::HostCallResult(HostCallResult {
-                        call_id: call.call_id.clone(),
-                        outcome: HostCallOutcome::Ok {
-                            result: json!({"accepted": true}),
-                        },
-                    }))
-                    .await;
-                    call.payload
+            for _ in 0..8 {
+                match self.recv().await {
+                    PluginToHost::HostCall(call) => {
+                        let matched = call.method == expected_method;
+                        let payload = call.payload.clone();
+                        self.answer(call).await;
+                        if matched {
+                            return payload;
+                        }
+                    }
+                    other => panic!("expected HostCall({expected_method}), got {other:?}"),
                 }
-                other => panic!("expected HostCall, got {other:?}"),
             }
+            panic!("expected HostCall({expected_method}) not seen");
         }
     }
 
@@ -993,6 +1075,50 @@ mod tests {
         assert_eq!(gate["mode"], json!("none"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写操作（custom）后推送管理面快照：`report_ui_state` 携带新门控模式。
+    #[tokio::test]
+    async fn custom_write_pushes_ui_state_snapshot() {
+        let (mut host, _plugin) = FakeHost::start(QqPlugin::new());
+        host.handshake(json!({"name": "qq-ui"}), "qq-ui").await;
+
+        host.send(&HostToPlugin::Invoke(Invoke {
+            call_id: "ui:1".to_string(),
+            contribution: "qq-ui:custom".to_string(),
+            ctx: Default::default(),
+            payload: json!({"method": "set_gate_mode", "payload": {"mode": "allowlist"}}),
+        }))
+        .await;
+
+        let mut got_result = false;
+        let mut pushed: Option<Value> = None;
+        for _ in 0..12 {
+            match host.recv().await {
+                PluginToHost::HostCall(call) => {
+                    let method = call.method.clone();
+                    let payload = call.payload.clone();
+                    host.answer(call).await;
+                    if method == "report_ui_state"
+                        && payload["state"]["gate"]["mode"] == json!("allowlist")
+                    {
+                        pushed = Some(payload);
+                    }
+                }
+                PluginToHost::InvokeResult(_) => got_result = true,
+                other => panic!("unexpected frame {other:?}"),
+            }
+            if got_result && pushed.is_some() {
+                break;
+            }
+        }
+        assert!(got_result, "custom op result missing");
+        let pushed = pushed.expect("report_ui_state with new gate mode expected");
+        assert_eq!(pushed["adapter"], json!("qq-ui"));
+
+        let FakeHost { stream, session } = host;
+        drop(stream);
+        let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
     }
 
     /// `HostMediaStore`：字节写临时文件 → `store_media` 回呼（宿主读到原字节）
