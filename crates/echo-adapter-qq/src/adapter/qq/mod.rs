@@ -336,6 +336,16 @@ impl QqAdapter {
             .expect("message hook poisoned") = Some(hook);
     }
 
+    /// 当前消息钩子（插件入口测试 / 集成自检：入站与连接态经它回调）。
+    #[allow(dead_code)]
+    pub(crate) fn message_hook(&self) -> Option<Arc<dyn echo_adapter::InboundMessageHook>> {
+        self.inner
+            .message_hook
+            .lock()
+            .expect("message hook poisoned")
+            .clone()
+    }
+
     /// Register an additional handler (e.g. Echo, Help, Admin).
     pub fn add_handler(&self, handler: Box<dyn echo_server::Handler>) {
         self.inner

@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 echo-adapter = { path = "../../vendor/echo-adapter" }
+# 开发期：本机 path 依赖（SDK 未发布通道）；发布后切 git tag。
+echo-plugin-sdk = { path = "/home/evence/.local/share/echo-agent-core/source/source/plugin/echo-plugin-sdk" }
 echo-core = { path = "../echo-core" }
 echo-defs = { path = "../../vendor/echo-defs" }
 echo-server = { path = "../echo-server" }
@@ -20,6 +22,7 @@ async-trait.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

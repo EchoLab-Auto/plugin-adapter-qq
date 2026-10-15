@@ -15,6 +15,7 @@ pub mod file_bridge;
 pub mod files;
 pub mod handler;
 pub mod napcat;
+pub mod plugin;
 
 pub use adapter::QqAdapter;
 pub use config::{QqAdapterConfig, QqFilterConfig, QqServerConfig, QqTriggerConfig};
