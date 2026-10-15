@@ -114,11 +114,16 @@ impl Default for PluginConfig {
 #[echo_plugin_sdk::async_trait]
 impl AdapterPlugin for QqPlugin {
     async fn configure(&self, config: Value) -> Result<(), String> {
-        let parsed: PluginConfig = if config.is_null() {
+        let mut parsed: PluginConfig = if config.is_null() {
             PluginConfig::default()
         } else {
             serde_json::from_value(config).map_err(|e| format!("invalid qq plugin config: {e}"))?
         };
+        if let Some(path) = &parsed.state_file {
+            // 宿主下发的配置是基线；插件侧持久化的运行期状态（门控 / 名单 /
+            // owner）覆盖其上——崩溃重启不得回退到默认（安全相关）。
+            apply_persisted_state(&mut parsed.config, path);
+        }
         let adapter = QqAdapter::with_instance(parsed.name.clone(), parsed.persona.clone(), parsed.config);
         if let Some(path) = &parsed.state_file {
             adapter.set_config_store(ConfigStore::new(path.clone()));
@@ -293,6 +298,65 @@ fn message_to_wire(msg: &IncomingMessage) -> Value {
         "images": msg.images,
         "files": files,
     })
+}
+
+/// 读取插件侧持久化的运行期状态（`[adapters.qq]`：gate / filter 名单 /
+/// owner_qq）并合并进宿主下发的配置。
+///
+/// 只合并**运行期可变**的字段：名单与门控模式、owner。`filter` 的其余
+/// 段（限流 / 关键词 / 内容长度）是静态配置，保持宿主下发值整段保留。
+/// 文件缺失 / 损坏时回退宿主配置并告警（fail-open 到显式配置，不阻塞启动）。
+fn apply_persisted_state(config: &mut QqAdapterConfig, path: &str) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "qq state file unreadable; using host-provided config");
+            return;
+        }
+    };
+    let root: toml::Table = match toml::from_str(&content) {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "qq state file invalid; using host-provided config");
+            return;
+        }
+    };
+    let Some(qq) = root
+        .get("adapters")
+        .and_then(|adapters| adapters.get("qq"))
+        .and_then(toml::Value::as_table)
+        .cloned()
+    else {
+        return;
+    };
+
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PersistedState {
+        gate: Option<crate::config::QqGateConfig>,
+        filter: Option<crate::config::QqFilterConfig>,
+        owner_qq: Option<i64>,
+    }
+
+    let persisted = match toml::Value::Table(qq).try_into::<PersistedState>() {
+        Ok(persisted) => persisted,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "qq state file section invalid; using host-provided config");
+            return;
+        }
+    };
+    if let Some(gate) = persisted.gate {
+        config.gate = gate;
+    }
+    if let Some(filter) = persisted.filter {
+        config.filter.allowlist = filter.allowlist;
+        config.filter.denylist = filter.denylist;
+    }
+    if let Some(owner_qq) = persisted.owner_qq {
+        config.owner_qq = owner_qq;
+    }
+    tracing::info!(path, "qq runtime state merged from state file");
 }
 
 /// 出站目标解析（`{channel: {type …}, user_id}` → [`MessageTarget`]）。
@@ -820,6 +884,75 @@ mod tests {
             .expect("session should finish after stream close")
             .expect("session task should not panic");
         result.expect("session should exit cleanly");
+    }
+
+    /// 运行期状态（门控 / 名单 / owner）持久化：重启后覆盖宿主基线，不回退。
+    #[tokio::test]
+    async fn runtime_state_persists_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("qq-state-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let state_file = dir.join("qq-state.toml");
+        let state_file_str = state_file.to_str().expect("utf-8 path").to_string();
+        let base_config = json!({
+            "name": "qq-state",
+            "state_file": state_file_str,
+            "config": {"gate": {"mode": "none"}, "owner_qq": 0},
+        });
+
+        // 第一次生命周期：改门控 / owner / 名单 → 落盘。
+        {
+            let plugin = QqPlugin::new();
+            plugin.configure(base_config.clone()).await.expect("configure");
+            let adapter = plugin.adapter_handle().expect("adapter");
+            adapter
+                .invoke_custom("set_gate_mode", json!({"mode": "allowlist"}))
+                .await
+                .expect("set gate");
+            adapter
+                .invoke_custom("set_owner", json!({"owner_qq": 424242}))
+                .await
+                .expect("set owner");
+            adapter
+                .invoke_custom("update_allowlist", json!({"user_ids": [7], "group_ids": [42]}))
+                .await
+                .expect("allowlist");
+        }
+        let persisted = std::fs::read_to_string(&state_file).expect("state file written");
+        assert!(persisted.contains("allowlist"), "{persisted}");
+
+        // 重启：宿主仍下发旧基线（none / owner 0）→ 持久化状态必须胜出。
+        let plugin = QqPlugin::new();
+        plugin.configure(base_config.clone()).await.expect("reconfigure");
+        let adapter = plugin.adapter_handle().expect("adapter");
+        let gate = adapter
+            .invoke_custom("get_gate_mode", Value::Null)
+            .await
+            .expect("gate");
+        assert_eq!(gate["mode"], json!("allowlist"));
+        let owner = adapter
+            .invoke_custom("get_owner", Value::Null)
+            .await
+            .expect("owner");
+        assert_eq!(owner["owner_qq"], json!(424242));
+        let filter = adapter
+            .invoke_custom("get_filter_config", Value::Null)
+            .await
+            .expect("filter");
+        assert_eq!(filter["allowlist_users"], json!(["7"]));
+        assert_eq!(filter["allowlist_groups"], json!(["42"]));
+
+        // 状态文件丢失（模拟被清理）：回退基线，不阻塞启动。
+        std::fs::remove_file(&state_file).expect("remove state file");
+        let plugin = QqPlugin::new();
+        plugin.configure(base_config).await.expect("configure without state");
+        let adapter = plugin.adapter_handle().expect("adapter");
+        let gate = adapter
+            .invoke_custom("get_gate_mode", Value::Null)
+            .await
+            .expect("gate");
+        assert_eq!(gate["mode"], json!("none"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `Hello.config` 非法 → `Failed{invalid_config}`，会话以错误退出。

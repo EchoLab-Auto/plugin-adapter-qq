@@ -20,7 +20,8 @@ QQ / OneBot v11 适配器——独立进程的适配器插件（stdio 协议，�
 {
   "name": "qq",                  // 实例名（= Invoke 前缀；缺省 "qq"）
   "persona": "default",          // 归属人格（可选）
-  "state_file": "/path/qq.toml", // 门控 / owner 运行期持久化文件（可选）
+  "state_file": "/path/qq.toml", // 运行期状态持久化文件（可选；门控 / 名单 / owner，
+                                 //  重启时覆盖宿主基线——崩溃不回退）
   "config": { /* QqAdapterConfig：端口 / NapCat / 过滤…… */ }
 }
 ```
