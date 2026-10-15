@@ -1,0 +1,24 @@
+[package]
+name = "echo-server"
+description = "Reverse WebSocket server and handler dispatch for OneBot v11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+echo-core = { path = "../echo-core" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tungstenite = "0.24"

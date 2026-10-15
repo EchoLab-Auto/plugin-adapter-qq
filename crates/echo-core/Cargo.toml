@@ -1,0 +1,15 @@
+[package]
+name = "echo-core"
+description = "OneBot v11 protocol types (events, actions, message segments)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"
