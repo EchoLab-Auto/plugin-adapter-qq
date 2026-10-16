@@ -62,3 +62,23 @@ ECHO_LOG=debug ./target/debug/echo-adapter-qq   # 手动调试（日志走 stder
 ```
 
 开发期 `echo-plugin-sdk` 以本机 path 依赖（`~/.local/share/echo-agent-core/source/source/plugin/echo-plugin-sdk`）；SDK 发布后切换 git tag。
+
+## 部署
+
+```bash
+scripts/deploy.sh              # 一键：构建 → 安装 → 重启 Core → 健康检查（等待 QQ 重连）
+scripts/deploy.sh --check      # 只读健康检查（安装 / Core / 插件进程 / QQ 连接）
+scripts/deploy.sh --rollback   # 回滚到上一版本（<target>.rollback）并重启
+scripts/deploy.sh --help       # 全部选项
+```
+
+`scripts/deploy.sh` 与 Core 自更新脚本（`~/.local/libexec/echo-agent-core/update.sh`）
+语义对齐：同目录临时文件 + 原子替换（可安全替换运行中的二进制）、替换前保留
+`<target>.rollback` 备份、与 Core 自更新共用 `update.lock`、重启后等待 NapCat
+自动重连（40s 窗口，超时才 `docker restart` 兜底）。安装路径缺省读
+`core.toml` 的 `[adapters.qq.plugin] command`，兜底约定目录
+`~/.local/libexec/echo-agent-core/plugins/echo-adapter-qq/echo-adapter-qq`。
+
+> 注意：若在 Core 服务的 cgroup 内运行（例如经 Agent 工具调用），`restart` 会
+> 连带终止脚本本身（验证与自动回滚不会执行）——请在独立终端运行，或用
+> `systemd-run --user --scope` 脱出 cgroup。
