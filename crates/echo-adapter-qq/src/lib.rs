@@ -20,6 +20,7 @@ pub mod media;
 pub mod napcat;
 pub mod plugin;
 pub mod types;
+pub mod ui;
 
 pub use adapter::QqAdapter;
 pub use config::{QqAdapterConfig, QqFilterConfig, QqServerConfig, QqTriggerConfig};

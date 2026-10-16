@@ -1284,15 +1284,25 @@ impl QqAdapter {
             }
             "get_gate_mode" => Ok(json!({"mode": gate_mode_str(self.get_gate_mode())})),
             "update_allowlist" => {
-                let users = parse_ids(&payload, "user_ids")?;
-                let groups = parse_ids(&payload, "group_ids")?;
-                self.update_allowlist(users, groups);
+                // 部分载荷（只发 user_ids 或只发 group_ids）：缺键 = 保留现值，
+                // 避免「只更新用户名单」把群名单整体清空（01a §2.3 / 03a Q1）。
+                let users = parse_ids_opt(&payload, "user_ids")?;
+                let groups = parse_ids_opt(&payload, "group_ids")?;
+                let current = self.get_filter_config();
+                self.update_allowlist(
+                    users.unwrap_or(current.allowlist.user_ids),
+                    groups.unwrap_or(current.allowlist.group_ids),
+                );
                 Ok(json!({}))
             }
             "update_denylist" => {
-                let users = parse_ids(&payload, "user_ids")?;
-                let groups = parse_ids(&payload, "group_ids")?;
-                self.update_denylist(users, groups);
+                let users = parse_ids_opt(&payload, "user_ids")?;
+                let groups = parse_ids_opt(&payload, "group_ids")?;
+                let current = self.get_filter_config();
+                self.update_denylist(
+                    users.unwrap_or(current.denylist.user_ids),
+                    groups.unwrap_or(current.denylist.group_ids),
+                );
                 Ok(json!({}))
             }
             "get_filter_config" => {
@@ -1310,6 +1320,12 @@ impl QqAdapter {
                 Ok(json!({"owner_qq": owner}))
             }
             "get_owner" => Ok(json!({"owner_qq": self.get_owner_qq()})),
+            // 状态文档主动拉取（01a §1.3 失效兜底 / 03b §2.3-5「请求重推状态」）：
+            // 返回完整 cached_state；插件 custom 路由在返回后补一次
+            // `report_ui_state` 推送（plugin.rs `"custom"` 臂）。
+            "get_state" => self
+                .cached_state()
+                .ok_or_else(|| AdapterError::Internal("no cached state available".into())),
             "login_status" => Ok(json!({
                 "running": self.inner.running.load(Ordering::SeqCst),
                 "online": self.inner.connected.load(Ordering::SeqCst),
@@ -1463,6 +1479,18 @@ fn gate_mode_str(mode: QqGateMode) -> &'static str {
 /// id 列表 → 字符串形态（线协议与旧管理面统一以字符串跨层）。
 fn stringify_ids(ids: &[i64]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
+}
+
+/// 从 JSON 载荷解析**可选** id 列表（接受数字与字符串两种形态）。
+///
+/// 与 [`parse_ids`] 的区别只在缺键语义：`None` = 载荷未给出该字段
+/// （调用方保留现值），而不是「空表」——`update_*list` 的部分载荷
+/// 修复依赖这一点（01a §2.3）。
+fn parse_ids_opt(payload: &Value, key: &str) -> Result<Option<Vec<i64>>, AdapterError> {
+    if payload.get(key).is_none() {
+        return Ok(None);
+    }
+    parse_ids(payload, key).map(Some)
 }
 
 /// 从 JSON 载荷解析 id 列表（接受数字与字符串两种形态；缺省 = 空表）。
@@ -1734,6 +1762,162 @@ mod tests {
         // 固有读取与管理面快照同源：set_owner 经 invoke_custom 写入后，
         // 固有 getter 与 cached_state 均可见（单一事实来源）。
         assert_eq!(adapter.get_owner_qq(), 4242);
+    }
+
+    /// 部分载荷修复（01a §2.3 / 03a Q1）：`update_allowlist` / `update_denylist`
+    /// 只带一个名单字段时，另一名单保持现值——不再被整体覆盖清空。
+    #[tokio::test]
+    async fn update_lists_accept_partial_payloads() {
+        let adapter = QqAdapter::new(QqAdapterConfig::default());
+        // 先写入两张表（number / string 混用：两种 id 形态等价）。
+        adapter
+            .invoke_custom(
+                "update_allowlist",
+                json!({"user_ids": [7, "8"], "group_ids": [99]}),
+            )
+            .await
+            .expect("update_allowlist ok");
+        adapter
+            .invoke_custom(
+                "update_denylist",
+                json!({"user_ids": [66], "group_ids": [999]}),
+            )
+            .await
+            .expect("update_denylist ok");
+
+        // 只发 user_ids：群名单保持原值不变。
+        adapter
+            .invoke_custom("update_allowlist", json!({"user_ids": [1]}))
+            .await
+            .expect("partial allowlist ok");
+        let cfg = adapter.get_filter_config();
+        assert_eq!(cfg.allowlist.user_ids, vec![1]);
+        assert_eq!(
+            cfg.allowlist.group_ids,
+            vec![99],
+            "只更新用户名单不得清空群名单"
+        );
+
+        // 反向：只发 group_ids：用户名单保持原值不变。
+        adapter
+            .invoke_custom("update_allowlist", json!({"group_ids": ["1000"]}))
+            .await
+            .expect("partial allowlist ok");
+        let cfg = adapter.get_filter_config();
+        assert_eq!(cfg.allowlist.user_ids, vec![1]);
+        assert_eq!(cfg.allowlist.group_ids, vec![1000]);
+
+        // denylist 同口径（只发 group_ids：用户名单保留）。
+        adapter
+            .invoke_custom("update_denylist", json!({"group_ids": [1001]}))
+            .await
+            .expect("partial denylist ok");
+        let cfg = adapter.get_filter_config();
+        assert_eq!(cfg.denylist.user_ids, vec![66]);
+        assert_eq!(cfg.denylist.group_ids, vec![1001]);
+
+        // 线格式读取：id 一律字符串（00 §三）。
+        let out = adapter
+            .invoke_custom("get_filter_config", json!({}))
+            .await
+            .expect("get_filter_config ok");
+        assert_eq!(out["allowlist_users"], json!(["1"]));
+        assert_eq!(out["allowlist_groups"], json!(["1000"]));
+        assert_eq!(out["denylist_users"], json!(["66"]));
+        assert_eq!(out["denylist_groups"], json!(["1001"]));
+    }
+
+    /// id 宽容（00 §一 / 01a §2.3）：number 数组与 string 数组效果等价；
+    /// `set_owner` 亦接受字符串数字。
+    #[tokio::test]
+    async fn update_lists_accept_number_and_string_ids() {
+        let adapter = QqAdapter::new(QqAdapterConfig::default());
+        adapter
+            .invoke_custom(
+                "update_allowlist",
+                json!({"user_ids": [11, 22], "group_ids": [33]}),
+            )
+            .await
+            .expect("number payload ok");
+        let numeric = adapter.get_filter_config().allowlist;
+
+        adapter
+            .invoke_custom(
+                "update_allowlist",
+                json!({"user_ids": ["11", "22"], "group_ids": ["33"]}),
+            )
+            .await
+            .expect("string payload ok");
+        let textual = adapter.get_filter_config().allowlist;
+
+        assert_eq!(numeric.user_ids, textual.user_ids);
+        assert_eq!(numeric.group_ids, textual.group_ids);
+
+        // set_owner 的 parse_id 宽容字符串数字（W2.4 前置）。
+        let out = adapter
+            .invoke_custom("set_owner", json!({"owner_qq": "4242"}))
+            .await
+            .expect("string owner ok");
+        assert_eq!(out["owner_qq"], json!(4242));
+        assert_eq!(adapter.get_owner_qq(), 4242);
+    }
+
+    /// `get_state`（01a §1.3 / 00 §四）：返回完整管理面状态文档
+    /// （instance / gate / owner），与 `cached_state` 同源。
+    #[tokio::test]
+    async fn get_state_returns_cached_state_document() {
+        let adapter =
+            QqAdapter::with_instance("qq-test", Some("alix".into()), QqAdapterConfig::default());
+        let state = adapter
+            .invoke_custom("get_state", json!({}))
+            .await
+            .expect("get_state ok");
+        assert_eq!(state["instance"]["persona"], json!("alix"));
+        assert!(state["gate"].is_object(), "gate 段缺失：{state}");
+        assert!(state["owner"].is_i64(), "owner 段缺失：{state}");
+        assert_eq!(state, adapter.cached_state().expect("cached state"));
+    }
+
+    /// 目录方法的线格式（00 §三）：`get_groups` / `get_friends` 的 id 一律
+    /// 字符串——OneBot 返回数字 id，跨层统一字符串化。
+    #[tokio::test]
+    async fn directory_methods_stringify_ids() {
+        let onebot = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/get_group_list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": [{"group_id": 987654, "group_name": "known group"}]
+            })))
+            .mount(&onebot)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/get_friend_list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": [{"user_id": 111, "nickname": "allowed"}]
+            })))
+            .mount(&onebot)
+            .await;
+
+        let adapter = QqAdapter::new(QqAdapterConfig {
+            napcat_onebot_url: onebot.uri(),
+            ..Default::default()
+        });
+        adapter.inner.running.store(true, Ordering::SeqCst);
+
+        let groups = adapter
+            .invoke_custom("get_groups", json!({}))
+            .await
+            .expect("get_groups ok");
+        assert_eq!(groups["groups"][0]["id"], json!("987654"));
+        let friends = adapter
+            .invoke_custom("get_friends", json!({}))
+            .await
+            .expect("get_friends ok");
+        assert_eq!(friends["friends"][0]["id"], json!("111"));
     }
 
     async fn mount_login_info(server: &MockServer, user_id: i64) {

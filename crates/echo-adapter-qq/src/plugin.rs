@@ -37,6 +37,7 @@ use crate::types::{
 use crate::adapter::qq::DEFAULT_INSTANCE_NAME;
 use crate::adapter::QqAdapter;
 use crate::config::QqAdapterConfig;
+use crate::ui;
 
 /// 适配器宿主服务名（`HostCall.service`）。
 const ADAPTER_HOST_SERVICE: &str = "adapter_host";
@@ -183,9 +184,11 @@ impl AdapterPlugin for QqPlugin {
                 gating: true,
                 login: true,
             },
-            config_schema: None,
-            ui: None,
-            session_labels: None,
+            // 插件静态元数据（泛化 P1）：UI 描述符 / 会话标签 / 配置 Schema
+            // ——宿主 AdapterList 原样透传给 Panel 通用渲染器（01a §2）。
+            config_schema: Some(ui::config_schema()),
+            ui: Some(ui::ui_descriptor()),
+            session_labels: Some(ui::session_labels()),
         }
     }
 
@@ -1115,6 +1118,74 @@ mod tests {
         assert!(got_result, "custom op result missing");
         let pushed = pushed.expect("report_ui_state with new gate mode expected");
         assert_eq!(pushed["adapter"], json!("qq-ui"));
+
+        let FakeHost { stream, session } = host;
+        drop(stream);
+        let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+    }
+
+    /// 贡献注册携带 UI 描述符 / 会话标签 / 配置 Schema（泛化 P1，01a §2.3）：
+    /// 宿主 AdapterList 据此透传，Panel 通用渲染器无需 QQ 专属代码。
+    #[tokio::test]
+    async fn contribution_carries_ui_metadata() {
+        let plugin = QqPlugin::new();
+        plugin
+            .configure(json!({"name": "qq-ui"}))
+            .await
+            .expect("configure ok");
+        let contribution = plugin.adapter();
+        let ui = contribution.ui.expect("ui descriptor registered");
+        assert_eq!(ui["version"], json!(1));
+        assert_eq!(ui["panels"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            contribution.session_labels,
+            Some(json!({"dm": "QQ 私聊", "group": "QQ 群"}))
+        );
+        let schema = contribution.config_schema.expect("config schema registered");
+        assert_eq!(schema["required"], json!(["bind_address"]));
+    }
+
+    /// `get_state`（custom op，01a §1.3）：`qq-test:custom {method:"get_state"}`
+    /// 返回完整状态文档（instance / gate / owner），并补推一次
+    /// `report_ui_state` 快照（03b §2.3-5「请求重推状态」）。
+    #[tokio::test]
+    async fn get_state_custom_op_returns_state_and_pushes() {
+        let (mut host, _plugin) = FakeHost::start(QqPlugin::new());
+        host.handshake(json!({"name": "qq-test"}), "qq-test").await;
+
+        host.send(&HostToPlugin::Invoke(Invoke {
+            call_id: "state:1".to_string(),
+            contribution: "qq-test:custom".to_string(),
+            ctx: Default::default(),
+            payload: json!({"method": "get_state"}),
+        }))
+        .await;
+
+        let mut result: Option<Value> = None;
+        let mut pushed = false;
+        for _ in 0..12 {
+            match host.recv().await {
+                PluginToHost::HostCall(call) => {
+                    if call.method == "report_ui_state" {
+                        pushed = true;
+                    }
+                    host.answer(call).await;
+                }
+                PluginToHost::InvokeResult(res) => match res.outcome {
+                    InvokeOutcome::Ok { result: value, .. } => result = Some(value),
+                    other => panic!("get_state must succeed, got {other:?}"),
+                },
+                other => panic!("unexpected frame {other:?}"),
+            }
+            if result.is_some() && pushed {
+                break;
+            }
+        }
+        let state = result.expect("get_state result missing");
+        for key in ["instance", "gate", "owner"] {
+            assert!(state.get(key).is_some(), "状态文档缺 {key}：{state}");
+        }
+        assert!(pushed, "get_state 返回后应推送 report_ui_state 快照");
 
         let FakeHost { stream, session } = host;
         drop(stream);
