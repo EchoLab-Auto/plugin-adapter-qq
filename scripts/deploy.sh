@@ -162,7 +162,8 @@ wait_service_active() { # $1=窗口秒数
 }
 
 restart_core_and_wait() {
-    echo "重启 Core（systemctl --user restart $CORE_SERVICE）…"
+    # 注意：Core 停机时先优雅排空进行中的 turn（上限 120s），故重启可能耗时 ~2 分钟。
+    echo "重启 Core（systemctl --user restart $CORE_SERVICE；有进行中的 turn 时先排空，最长约 2 分钟）…"
     systemctl --user restart "$CORE_SERVICE" >/dev/null 2>&1 || true
     if wait_service_active 30; then
         echo "Core 已恢复 active（PID $(core_main_pid)）"
