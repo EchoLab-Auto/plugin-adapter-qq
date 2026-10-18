@@ -107,6 +107,76 @@ impl QqPlugin {
             }
         });
     }
+
+    /// 统一分发表：**工具** → **生命周期 / 出站** → **平台管理方法**。
+    ///
+    /// | 顺序 | 表 | 例子 |
+    /// |---|---|---|
+    /// | 1 | 模型工具（`tools` 模块） | `send_private_msg` / `get_group_list` |
+    /// | 2 | 生命周期与出站 | `start` / `stop` / `status` / `send_text` / `get_groups` |
+    /// | 3 | 平台管理方法（`QqAdapter::invoke_custom`） | `set_gate_mode` / `login_qrcode` |
+    ///
+    /// 2026-10 之前这三张表是分开的：顶层 op 只查 2，`custom` 只查 3，
+    /// 于是 Panel 的「启动 / 停止 / 状态」按钮（走 `custom` + method）全部报
+    /// `unknown adapter method` —— 工具 / 生命周期在管理面路径上不可达。
+    /// 合表后两个入口语义一致。
+    ///
+    /// `via_custom` 只影响**未知名字的错误码**：直连 op 的未知名是协议层
+    /// `unknown_op`，而 `custom` 的未知 method 是平台管理方法表的
+    /// `adapter_error`（调用方据此区分「我发错了 op」与「插件没实现该方法」）。
+    async fn dispatch(
+        &self,
+        adapter: &std::sync::Arc<crate::adapter::QqAdapter>,
+        op: &str,
+        payload: Value,
+        via_custom: bool,
+    ) -> InvokeOutcome {
+        // 1) 模型工具（平台语义在 `tools` 模块；宿主不认识任何工具名）。
+        if let Some(outcome) = crate::tools::invoke(adapter, op, payload.clone()).await {
+            return outcome;
+        }
+        // 2) 生命周期 / 出站 / 目录。
+        match op {
+            "start" => {
+                return match adapter.start().await {
+                    Ok(()) => {
+                        self.push_ui_state();
+                        ok_result(json!({}))
+                    }
+                    Err(e) => error_outcome("adapter_error", e.to_string()),
+                }
+            }
+            "stop" => {
+                return match adapter.stop().await {
+                    Ok(()) => {
+                        self.push_ui_state();
+                        ok_result(json!({}))
+                    }
+                    Err(e) => error_outcome("adapter_error", e.to_string()),
+                }
+            }
+            "status" => {
+                let info = adapter.status_info();
+                return ok_result(json!({
+                    "state": state_str(info.status),
+                    "self_id": info.self_id,
+                    "started_at": info.started_at,
+                }));
+            }
+            "send_text" => return send_text(adapter, &payload).await,
+            "send_media" => return send_media(adapter, &payload).await,
+            "get_groups" | "get_friends" => {
+                return custom_op(adapter, op, Value::Null).await;
+            }
+            _ => {}
+        }
+        // 3) 平台管理方法。
+        if !via_custom {
+            // 直连 op 走到这里 = 插件没有这个 op（协议层错误，不是管理方法缺失）。
+            return error_outcome("unknown_op", format!("unknown adapter op: {op}"));
+        }
+        custom_op(adapter, op, payload).await
+    }
 }
 
 impl Default for QqPlugin {
@@ -258,56 +328,24 @@ impl InstancePlugin for QqPlugin {
         let Some(adapter) = self.state.adapter.get().cloned() else {
             return error_outcome("not_configured", "qq plugin received no config");
         };
-        // 模型工具优先（工具名 → 内部 handler 的映射在 `tools` 模块）。
-        if let Some(outcome) = crate::tools::invoke(&adapter, op, payload.clone()).await {
+        // `custom` 是宿主侧的**统一入口**：Core 的工具桥
+        // （`instance_tools::invoke_management`）与管理面（`InvokeInstanceOp`）
+        // 都经 `invoke_custom(<method>, <payload>)` 下发，线上即
+        // `Invoke("<instance>:custom", {method, payload})`。因此 method 可能是
+        // 工具名、生命周期 op、出站 op 或平台管理方法之一——三者走**同一张
+        // 分发表**（[`Self::dispatch`]），先命中者生效。
+        if op == "custom" {
+            let Some(method) = payload.get("method").and_then(Value::as_str) else {
+                return error_outcome("invalid_payload", "custom requires `method`");
+            };
+            let inner = payload.get("payload").cloned().unwrap_or(Value::Null);
+            let outcome = self.dispatch(&adapter, method, inner, true).await;
+            // 管理面状态可能已变（写方法）：推送快照，宿主缓存随之刷新。
+            self.push_ui_state();
             return outcome;
         }
-        match op {
-            "start" => match adapter.start().await {
-                Ok(()) => {
-                    self.push_ui_state();
-                    ok_result(json!({}))
-                }
-                Err(e) => error_outcome("adapter_error", e.to_string()),
-            },
-            "stop" => match adapter.stop().await {
-                Ok(()) => {
-                    self.push_ui_state();
-                    ok_result(json!({}))
-                }
-                Err(e) => error_outcome("adapter_error", e.to_string()),
-            },
-            "status" => {
-                let info = adapter.status_info();
-                ok_result(json!({
-                    "state": state_str(info.status),
-                    "self_id": info.self_id,
-                    "started_at": info.started_at,
-                }))
-            }
-            "send_text" => send_text(&adapter, &payload).await,
-            "send_media" => send_media(&adapter, &payload).await,
-            "get_groups" | "get_friends" => custom_op(&adapter, op, Value::Null).await,
-            "custom" => {
-                let Some(method) = payload.get("method").and_then(Value::as_str) else {
-                    return error_outcome("invalid_payload", "custom requires `method`");
-                };
-                let inner = payload.get("payload").cloned().unwrap_or(Value::Null);
-                // **工具名也是合法 method**：宿主侧的工具桥（Core
-                // `instance_tools`）统一经 `invoke_custom(<工具名>, <参数>)` 执行，
-                // 因此 `custom` 必须先过工具表，否则模型调 `send_private_msg`
-                // 会落到管理方法表里报 `unknown adapter method`
-                // （2026-10 实测踩到：10 个工具全部不可用）。
-                let outcome = match crate::tools::invoke(&adapter, method, inner.clone()).await {
-                    Some(outcome) => outcome,
-                    None => custom_op(&adapter, method, inner).await,
-                };
-                // 管理面状态可能已变（写方法）：推送快照，宿主缓存随之刷新。
-                self.push_ui_state();
-                outcome
-            }
-            other => error_outcome("unknown_op", format!("unknown adapter op: {other}")),
-        }
+        // 直连 op（Core 内部生命周期：`RemoteInstance::start()` 等）。
+        self.dispatch(&adapter, op, payload, false).await
     }
 
     async fn on_ready(&self, host: HostClient) {
@@ -1174,8 +1212,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 回归（2026-10）：宿主工具桥统一经 `custom` op 执行工具
-    /// （Core `instance_tools::invoke_management` → `invoke_custom(<工具名>)`）。
+    /// 回归（2026-10）：`custom` 入口必须到达**全部三张表**（工具 / 生命周期 /
+    /// 管理方法）。
+    ///
+    /// Core 的工具桥（`instance_tools::invoke_management`）与管理面
+    /// （`InvokeInstanceOp`）都经 `invoke_custom(<method>, <payload>)` 下发，
+    /// 线上即 `Invoke("<instance>:custom", {method, payload})`。此前 `custom`
+    /// 只查管理方法表，于是：
+    /// - 模型调 `send_private_msg` → `unknown adapter method`（10 个工具全废）
+    /// - Panel 点「启动 / 停止 / 状态」 → 同样 `unknown adapter method`
+    #[tokio::test]
+    async fn custom_op_reaches_every_table() {
+        let plugin = QqPlugin::new();
+        plugin
+            .configure(json!({"name": "qq-tables", "config": {"gate": {"mode": "none"}}}))
+            .await
+            .expect("configure");
+
+        // 表 2：生命周期与出站（此前在 custom 路径上不可达）。
+        for lifecycle in ["status", "start"] {
+            let outcome = plugin
+                .invoke_op("custom", json!({"method": lifecycle, "payload": {}}))
+                .await;
+            let rendered = format!("{outcome:?}");
+            assert!(
+                !rendered.contains("unknown adapter method"),
+                "生命周期 op `{lifecycle}` 在 custom 路径不可达：{rendered}"
+            );
+        }
+        // 表 3：平台管理方法。
+        let outcome = plugin
+            .invoke_op("custom", json!({"method": "get_gate_mode", "payload": {}}))
+            .await;
+        assert!(
+            !format!("{outcome:?}").contains("unknown adapter method"),
+            "管理方法在 custom 路径不可达：{outcome:?}"
+        );
+        // 未知名：管理表报可读错误（不是 panic，也不是 unknown_op）。
+        let outcome = plugin
+            .invoke_op("custom", json!({"method": "no_such_method", "payload": {}}))
+            .await;
+        assert!(
+            format!("{outcome:?}").contains("unknown adapter method"),
+            "未知 method 应报管理表错误：{outcome:?}"
+        );
+    }
+
+    /// 回归（2026-10）：宿主工具桥统一经 `custom` op 执行工具。
     ///
     /// 若 `custom` 分支不过工具表，模型调 `send_private_msg` 会落到管理方法表
     /// 并报 `unknown adapter method` —— 10 个工具全部不可用（实测踩到）。
