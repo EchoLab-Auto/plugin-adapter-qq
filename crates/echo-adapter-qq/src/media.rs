@@ -1,4 +1,4 @@
-//! 媒体登记通道（P1.7c）：插件 → 宿主 `adapter_host.store_media` 回呼的
+//! 媒体登记通道（P1.7c）：插件 → 宿主 `core_api.store_media` 回呼的
 //! 插件侧抽象。
 //!
 //! 入站图片下载后不再本地落盘（旧 `media_store` 行为），而是经本通道把

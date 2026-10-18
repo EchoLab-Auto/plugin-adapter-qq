@@ -1,6 +1,6 @@
 //! 插件侧静态元数据：UI 描述符 / 会话标签 / 配置 Schema（泛化 P1）。
 //!
-//! 三份数据经 [`crate::plugin::QqPlugin::adapter`] 填入 `AdapterContribution`，
+//! 三份数据经 [`crate::plugin::QqPlugin::adapter`] 填入 `InstanceContribution`，
 //! 随注册下发宿主，再由 AdapterList 原样透传给 Panel 的通用渲染器——
 //! 插件只贡献 schema，渲染逻辑在 Panel（Panel UI 解耦）。
 //!

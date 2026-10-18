@@ -2,13 +2,13 @@
 //!
 //! **平台语义住在这里**：工具名、描述、参数 schema 都是 QQ / OneBot 的概念
 //! （群 / 私聊 / 卡片 / 语音 / 群历史）。宿主（EchoAgentCore）不认识任何一个
-//! 工具名——它按 [`AdapterContribution::tools`] 原样注册，调用时把参数透传回
+//! 工具名——它按 [`InstanceContribution::tools`] 原样注册，调用时把参数透传回
 //! 来（`Invoke("<instance>:<工具名>")`），命中本模块的 [`invoke`]。
 //!
 //! 这样新增一个平台（Telegram / Discord…）只需在它的插件里写同样一份声明，
 //! Core 零改动。
 //!
-//! [`AdapterContribution::tools`]: echo_plugin_api::AdapterContribution::tools
+//! [`InstanceContribution::tools`]: echo_plugin_api::InstanceContribution::tools
 
 use echo_plugin_sdk::echo_plugin_api::{InvokeOutcome, ToolContribution};
 use serde_json::{json, Value};
@@ -41,10 +41,10 @@ fn tool(name: &str, description: &str, parameters: Value, visible_reply: bool) -
         name: name.to_string(),
         description: description.to_string(),
         parameters,
-        category: "adapter".to_string(),
+        category: "instance".to_string(),
         timeout_hint_secs: None,
         // 与这两个技能同包：面板按包批量勾选时「工具 + 技能」是一组。
-        package: Some("echo-agent.adapter.qq".to_string()),
+        package: Some("echo-agent.instance.qq".to_string()),
         visible_reply,
     }
 }
@@ -388,7 +388,7 @@ mod tests {
         for tool in &tools {
             assert_eq!(
                 tool.package.as_deref(),
-                Some("echo-agent.adapter.qq"),
+                Some("echo-agent.instance.qq"),
                 "工具与 QQ 技能同包（面板按包勾选）"
             );
             assert_eq!(tool.parameters["type"], json!("object"));

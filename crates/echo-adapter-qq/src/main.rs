@@ -8,7 +8,7 @@
 //! 是协议通道，绝不能混入日志字节）。
 
 use echo_adapter_qq::plugin::QqPlugin;
-use echo_plugin_sdk::serve_adapter_stdio;
+use echo_plugin_sdk::{serve_stdio, InstanceHandler};
 
 #[tokio::main]
 async fn main() {
@@ -20,7 +20,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Err(error) = serve_adapter_stdio(QqPlugin::new()).await {
+    if let Err(error) = serve_stdio(InstanceHandler::new(QqPlugin::new())).await {
         eprintln!("qq adapter plugin exited: {error}");
         std::process::exit(1);
     }

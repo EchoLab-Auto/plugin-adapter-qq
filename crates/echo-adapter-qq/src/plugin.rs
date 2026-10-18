@@ -1,6 +1,6 @@
 //! 适配器插件入口（P1.7b）：把 [`QqAdapter`] 接到 `echo-plugin-sdk` 的
-//! `AdapterPlugin` 接口上——宿主经 stdio 拉起本进程后，用
-//! `Invoke("<实例名>:<op>")` 寻址；入站消息与连接态经 `adapter_host`
+//! `InstancePlugin` 接口上——宿主经 stdio 拉起本进程后，用
+//! `Invoke("<实例名>:<op>")` 寻址；入站消息与连接态经 `core_api`
 //! 宿主服务回呼。
 //!
 //! # 宿主下发配置（`Hello.config`）
@@ -22,8 +22,8 @@
 
 use std::sync::{Arc, OnceLock};
 
-use echo_plugin_sdk::echo_plugin_api::{AdapterCapabilities, AdapterContribution, InvokeOutcome};
-use echo_plugin_sdk::{AdapterPlugin, HostCallError, HostClient};
+use echo_plugin_sdk::echo_plugin_api::{InstanceCapabilities, InstanceContribution, InvokeOutcome};
+use echo_plugin_sdk::{HostCallError, HostClient, InstancePlugin};
 use serde_json::{json, Value};
 
 use crate::config_store::ConfigStore;
@@ -38,7 +38,7 @@ use crate::config::QqAdapterConfig;
 use crate::ui;
 
 /// 适配器宿主服务名（`HostCall.service`）。
-const ADAPTER_HOST_SERVICE: &str = "adapter_host";
+const CORE_API_SERVICE: &str = "core_api";
 
 /// QQ 适配器插件。
 ///
@@ -79,7 +79,7 @@ impl QqPlugin {
         self.state.host.get().cloned()
     }
 
-    /// 推送管理面状态快照（`adapter_host.report_ui_state`）——宿主缓存据此
+    /// 推送管理面状态快照（`core_api.report_ui_state`）——宿主缓存据此
     /// 服务管理读路径（`cached_state`）与 Panel 状态卡。
     ///
     /// fire-and-forget：调用点不等待（回执失败只记 debug）。
@@ -97,9 +97,9 @@ impl QqPlugin {
             let name = adapter.name().to_string();
             if let Err(e) = host
                 .call(
-                    ADAPTER_HOST_SERVICE,
+                    CORE_API_SERVICE,
                     "report_ui_state",
-                    json!({"adapter": name, "state": state}),
+                    json!({"instance": name, "state": state}),
                 )
                 .await
             {
@@ -141,7 +141,7 @@ impl Default for PluginConfig {
 }
 
 #[echo_plugin_sdk::async_trait]
-impl AdapterPlugin for QqPlugin {
+impl InstancePlugin for QqPlugin {
     async fn configure(&self, config: Value) -> Result<(), String> {
         let mut parsed: PluginConfig = if config.is_null() {
             PluginConfig::default()
@@ -165,7 +165,7 @@ impl AdapterPlugin for QqPlugin {
         Ok(())
     }
 
-    fn adapter(&self) -> AdapterContribution {
+    fn instance(&self) -> InstanceContribution {
         let (name, display_name) = match self.state.adapter.get() {
             Some(adapter) => (
                 adapter.name().to_string(),
@@ -174,11 +174,11 @@ impl AdapterPlugin for QqPlugin {
             // 未配置（SDK 必先调 configure；此处仅防御）：占位身份。
             None => (DEFAULT_INSTANCE_NAME.to_string(), "QQ / OneBot".to_string()),
         };
-        AdapterContribution {
+        InstanceContribution {
             name,
             platform: "qq".to_string(),
             display_name,
-            capabilities: AdapterCapabilities {
+            capabilities: InstanceCapabilities {
                 send_text: true,
                 send_media: true,
                 groups: true,
@@ -274,7 +274,7 @@ impl AdapterPlugin for QqPlugin {
     }
 }
 
-/// 入站消息钩子 → `adapter_host` 宿主服务（`deliver_message` / `report_state`）。
+/// 入站消息钩子 → `core_api` 宿主服务（`submit_input` / `report_state`）。
 struct HostBridge {
     host: HostClient,
     adapter: String,
@@ -292,7 +292,7 @@ impl InboundMessageHook for HostBridge {
         for attempt in 0..3 {
             match self
                 .host
-                .call(ADAPTER_HOST_SERVICE, "deliver_message", payload.clone())
+                .call(CORE_API_SERVICE, "submit_input", payload.clone())
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -305,7 +305,7 @@ impl InboundMessageHook for HostBridge {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        Err("deliver_message: backpressure persisted after retries".to_string())
+        Err("submit_input: backpressure persisted after retries".to_string())
     }
 
     fn on_connection_state(&self, _adapter_name: &str, connected: bool, self_id: Option<String>) {
@@ -315,14 +315,11 @@ impl InboundMessageHook for HostBridge {
         let qq = self.qq.clone();
         tokio::spawn(async move {
             let payload = json!({
-                "adapter": adapter,
+                "instance": adapter,
                 "connected": connected,
                 "self_id": self_id,
             });
-            if let Err(e) = host
-                .call(ADAPTER_HOST_SERVICE, "report_state", payload)
-                .await
-            {
+            if let Err(e) = host.call(CORE_API_SERVICE, "report_state", payload).await {
                 tracing::debug!(error = %e, "report_state host call failed");
             }
             // 连接态变化影响 `cached_state`（online / self_id）：刷新快照。
@@ -332,9 +329,9 @@ impl InboundMessageHook for HostBridge {
             let name = qq.name().to_string();
             if let Err(e) = host
                 .call(
-                    ADAPTER_HOST_SERVICE,
+                    CORE_API_SERVICE,
                     "report_ui_state",
-                    json!({"adapter": name, "state": state}),
+                    json!({"instance": name, "state": state}),
                 )
                 .await
             {
@@ -344,7 +341,7 @@ impl InboundMessageHook for HostBridge {
     }
 }
 
-/// 媒体登记通道：图片字节写临时文件 → 宿主 `adapter_host.store_media`
+/// 媒体登记通道：图片字节写临时文件 → 宿主 `core_api.store_media`
 /// （同机传 path，字节不过协议帧；见 `document/adapter-plugin.md` §安全边界）。
 struct HostMediaStore {
     host: HostClient,
@@ -361,7 +358,7 @@ impl MediaStore for HostMediaStore {
         let result = self
             .host
             .call(
-                ADAPTER_HOST_SERVICE,
+                CORE_API_SERVICE,
                 "store_media",
                 json!({"path": path.to_string_lossy(), "mime": mime}),
             )
@@ -377,7 +374,7 @@ impl MediaStore for HostMediaStore {
     }
 }
 
-/// `IncomingMessage` → `deliver_message` 线格式（`AdapterMessage` 同构）。
+/// `IncomingMessage` → `submit_input` 线格式（`AdapterMessage` 同构）。
 fn message_to_wire(msg: &IncomingMessage) -> Value {
     let channel = match &msg.channel {
         ChannelType::Direct => json!({"type": "dm"}),
@@ -396,7 +393,7 @@ fn message_to_wire(msg: &IncomingMessage) -> Value {
         })
         .collect();
     json!({
-        "adapter": msg.adapter_name,
+        "instance": msg.adapter_name,
         "platform": msg.platform,
         "user_id": msg.user_id,
         "user_name": if msg.user_name.is_empty() { None } else { Some(&msg.user_name) },
@@ -695,7 +692,7 @@ mod tests {
         Contribution, Hello, HostCallOutcome, HostCallResult, HostToPlugin, Invoke, PluginToHost,
         PROTOCOL_NAME, PROTOCOL_VERSION,
     };
-    use echo_plugin_sdk::{serve_io_with, AdapterHandler, ServeOptions};
+    use echo_plugin_sdk::{serve_io_with, InstanceHandler, ServeOptions};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// 假宿主：帧读写 + 手机会话（`serve_io_with` 的客户端侧）。
@@ -710,7 +707,7 @@ mod tests {
             let (reader, writer) = tokio::io::split(server);
             let handle = plugin.clone();
             let session = tokio::spawn(serve_io_with(
-                AdapterHandler::new(plugin),
+                InstanceHandler::new(plugin),
                 ServeOptions::default(),
                 reader,
                 writer,
@@ -762,7 +759,7 @@ mod tests {
                         .contributions
                         .iter()
                         .find_map(|c| match c {
-                            Contribution::Adapter(a) => Some(a),
+                            Contribution::PluginInstance(a) => Some(a),
                             _ => None,
                         })
                         .expect("adapter contribution registered");
@@ -785,7 +782,7 @@ mod tests {
             // `on_ready` 已完成：初始管理面状态快照（`report_ui_state`）是
             // Ready 之后的第一帧（单写者保证顺序）。回执它，保持测试确定。
             let payload = self.answer_host_call("report_ui_state").await;
-            assert_eq!(payload["adapter"], json!(expected_adapter));
+            assert_eq!(payload["instance"], json!(expected_adapter));
             assert!(
                 payload["state"]["instance"].is_object(),
                 "ui state snapshot should carry instance info: {payload}"
@@ -813,7 +810,7 @@ mod tests {
 
         /// 回执一个 HostCall（测试侧统一接受）。
         async fn answer(&mut self, call: echo_plugin_sdk::echo_plugin_api::HostCall) {
-            assert_eq!(call.service, "adapter_host");
+            assert_eq!(call.service, "core_api");
             self.send(&HostToPlugin::HostCallResult(HostCallResult {
                 call_id: call.call_id.clone(),
                 outcome: HostCallOutcome::Ok {
@@ -866,11 +863,11 @@ mod tests {
         }
     }
 
-    /// `message_to_wire`：入站消息 → `deliver_message` 线格式（字段完整）。
+    /// `message_to_wire`：入站消息 → `submit_input` 线格式（字段完整）。
     #[test]
     fn message_to_wire_conversion() {
         let wire = message_to_wire(&example_message());
-        assert_eq!(wire["adapter"], json!("qq-test"));
+        assert_eq!(wire["instance"], json!("qq-test"));
         assert_eq!(wire["channel"], json!({"type": "group", "group_id": "456"}));
         assert_eq!(wire["user_name"], json!("Alice"));
         assert_eq!(wire["at_me"], json!(true));
@@ -999,13 +996,13 @@ mod tests {
             other => panic!("expected unsupported_source, got {other:?}"),
         }
 
-        // 入站投递：hook（on_ready 已装）→ HostCall deliver_message。
+        // 入站投递：hook（on_ready 已装）→ HostCall submit_input。
         let adapter = plugin.adapter_handle().expect("adapter built");
         let hook = adapter.message_hook().expect("hook installed by on_ready");
         let deliver =
             tokio::spawn(async move { hook.on_incoming_message(example_message()).await });
-        let payload = host.answer_host_call("deliver_message").await;
-        assert_eq!(payload["message"]["adapter"], json!("qq-test"));
+        let payload = host.answer_host_call("submit_input").await;
+        assert_eq!(payload["message"]["instance"], json!("qq-test"));
         assert_eq!(payload["message"]["content"], json!("hello"));
         assert!(deliver.await.expect("join").is_ok());
 
@@ -1016,7 +1013,7 @@ mod tests {
             Some("4242".to_string()),
         );
         let payload = host.answer_host_call("report_state").await;
-        assert_eq!(payload["adapter"], json!("qq-test"));
+        assert_eq!(payload["instance"], json!("qq-test"));
         assert_eq!(payload["connected"], json!(true));
         assert_eq!(payload["self_id"], json!("4242"));
 
@@ -1148,7 +1145,7 @@ mod tests {
         }
         assert!(got_result, "custom op result missing");
         let pushed = pushed.expect("report_ui_state with new gate mode expected");
-        assert_eq!(pushed["adapter"], json!("qq-ui"));
+        assert_eq!(pushed["instance"], json!("qq-ui"));
 
         let FakeHost { stream, session } = host;
         drop(stream);
@@ -1164,7 +1161,7 @@ mod tests {
             .configure(json!({"name": "qq-ui"}))
             .await
             .expect("configure ok");
-        let contribution = plugin.adapter();
+        let contribution = plugin.instance();
         let ui = contribution.ui.expect("ui descriptor registered");
         assert_eq!(ui["version"], json!(1));
         assert_eq!(ui["panels"].as_array().map(Vec::len), Some(3));
@@ -1245,7 +1242,7 @@ mod tests {
         // 宿主侧读到临时文件的原字节后回执引用。
         let temp_path = match host.recv().await {
             PluginToHost::HostCall(call) => {
-                assert_eq!(call.service, "adapter_host");
+                assert_eq!(call.service, "core_api");
                 assert_eq!(call.method, "store_media");
                 assert_eq!(call.payload["mime"], json!("image/png"));
                 let path = call.payload["path"].as_str().expect("path").to_string();
