@@ -125,7 +125,20 @@ struct PluginConfig {
     persona: Option<String>,
     /// 门控 / owner 运行期持久化文件（可选；缺省不持久化）。
     state_file: Option<String>,
-    /// 适配器配置（含端口分配结果）。
+    /// 宿主数据目录（compose 落盘位置；`None` = 不生成 compose）。
+    #[serde(default)]
+    data_dir: Option<String>,
+    /// **新宿主**下发的共享层（原样，未合并）。
+    #[serde(default)]
+    shared: Option<toml::Table>,
+    /// **新宿主**下发的实例级覆盖（原样，未合并）。
+    #[serde(default)]
+    overrides: Option<toml::Table>,
+    /// 已合并的适配器配置。
+    ///
+    /// 两种来源：新宿主下发 `shared` + `overrides` 时由本插件合并派生（端口
+    /// 分配、容器名、compose 全在这里，宿主不认识）；旧宿主直接下发结果，
+    /// 本字段原样使用（过渡窗口）。
     config: QqAdapterConfig,
 }
 
@@ -135,6 +148,9 @@ impl Default for PluginConfig {
             name: DEFAULT_INSTANCE_NAME.to_string(),
             persona: None,
             state_file: None,
+            data_dir: None,
+            shared: None,
+            overrides: None,
             config: QqAdapterConfig::default(),
         }
     }
@@ -148,6 +164,48 @@ impl InstancePlugin for QqPlugin {
         } else {
             serde_json::from_value(config).map_err(|e| format!("invalid qq plugin config: {e}"))?
         };
+        // 新宿主只下发原始配置（shared + overrides），**部署形状由本插件算**：
+        // 合并 → 分配端口 → 派生容器名 / URL / compose → 落盘。旧宿主下发的
+        // `config` 已是成品，原样沿用（过渡窗口）。
+        if let (Some(shared), Some(overrides)) = (&parsed.shared, &parsed.overrides) {
+            let mut merged = crate::deploy::merge_tables(shared, overrides);
+            let store = parsed
+                .state_file
+                .as_ref()
+                .map(|path| ConfigStore::new(path.clone()));
+            let persisted = store
+                .as_ref()
+                .map(crate::deploy::load_persisted_ports)
+                .unwrap_or_default();
+            let ports = crate::deploy::resolve_ports(&merged, &parsed.name, persisted);
+            let data_dir = parsed.data_dir.as_ref().map(std::path::PathBuf::from);
+            crate::deploy::derive(
+                &mut merged,
+                overrides,
+                &parsed.name,
+                &ports,
+                data_dir.as_deref(),
+            );
+            if let (Some(store), Some(dir)) = (&store, &data_dir) {
+                // 端口持久化：跨重启稳定，否则容器映射每次变、重连失效。
+                if let Err(error) = crate::deploy::persist_ports(store, &ports) {
+                    tracing::warn!(%error, "instance port persist failed");
+                }
+                // 多实例各写一份 compose（默认实例沿用既有容器，不生成）。
+                if parsed.name != crate::deploy::DEFAULT_INSTANCE {
+                    match crate::deploy::write_compose(dir, &parsed.name, &ports) {
+                        Ok(path) => {
+                            tracing::debug!(path = %path.display(), "instance compose written")
+                        }
+                        Err(error) => tracing::warn!(%error, "instance compose write failed"),
+                    }
+                }
+            }
+            let value = serde_json::to_value(&merged)
+                .map_err(|e| format!("merged config is not serializable: {e}"))?;
+            parsed.config = serde_json::from_value(value)
+                .map_err(|e| format!("invalid qq plugin config: {e}"))?;
+        }
         if let Some(path) = &parsed.state_file {
             // 宿主下发的配置是基线；插件侧持久化的运行期状态（门控 / 名单 /
             // owner）覆盖其上——崩溃重启不得回退到默认（安全相关）。

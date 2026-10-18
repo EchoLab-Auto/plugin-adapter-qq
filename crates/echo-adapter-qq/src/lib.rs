@@ -12,6 +12,7 @@
 pub mod adapter;
 pub mod config;
 pub mod config_store;
+pub mod deploy;
 pub mod file_bridge;
 pub mod files;
 pub mod filter;
