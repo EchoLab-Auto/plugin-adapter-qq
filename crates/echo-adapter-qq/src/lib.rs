@@ -19,6 +19,7 @@ pub mod handler;
 pub mod media;
 pub mod napcat;
 pub mod plugin;
+pub mod tools;
 pub mod types;
 pub mod ui;
 

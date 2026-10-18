@@ -22,7 +22,9 @@ fn update_allowlist_persists_group_members_open() {
     config.filter.allowlist.group_members_open = true;
 
     let adapter = QqAdapter::new(config);
-    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(file.path().to_path_buf()));
+    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(
+        file.path().to_path_buf(),
+    ));
 
     // 模拟 Panel 交互：运行时替换名单 → 触发 rebuild + persist。
     adapter.update_allowlist(vec![3], vec![4]);
@@ -61,7 +63,9 @@ fn update_allowlist_persists_group_members_open_false_as_is() {
     config.filter.allowlist.group_ids = vec![22];
 
     let adapter = QqAdapter::new(config);
-    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(file.path().to_path_buf()));
+    adapter.set_config_store(echo_adapter_qq::config_store::ConfigStore::new(
+        file.path().to_path_buf(),
+    ));
     adapter.update_allowlist(vec![33], vec![44]);
 
     let text = std::fs::read_to_string(file.path()).expect("read persisted config");

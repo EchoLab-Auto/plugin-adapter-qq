@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use base64::Engine as _;
 use crate::filter::FilterPipeline;
 use crate::types::{
-    AdapterConnectionState, AdapterError, AdapterEvent, AdapterInfo, ChannelType, IncomingFile,
-    InboundMessageHook, IncomingMessage, MessageTarget, SendResult,
+    AdapterConnectionState, AdapterError, AdapterEvent, AdapterInfo, ChannelType,
+    InboundMessageHook, IncomingFile, IncomingMessage, MessageTarget, SendResult,
 };
+use async_trait::async_trait;
+use base64::Engine as _;
 use echo_core::{Event as OneBotEvent, MessageEvent, Segment};
 use echo_server::{ConnCallback, Context, HandlerRegistry, Server, ServerConfig};
 use serde_json::{json, Value};
@@ -350,11 +350,7 @@ impl QqAdapter {
 
     /// 注入宿主媒体登记通道（插件入口在握手完成后调用；入站图片经它登记）。
     pub(crate) fn set_media_store(&self, store: Arc<dyn crate::media::MediaStore>) {
-        *self
-            .inner
-            .media_store
-            .lock()
-            .expect("media store poisoned") = Some(store);
+        *self.inner.media_store.lock().expect("media store poisoned") = Some(store);
     }
 
     /// 从管理方法载荷解析出站目标
@@ -1431,7 +1427,10 @@ impl QqAdapter {
             }
             // ── 目录 / 历史（宿主 QQ 工具的门控可见版本）──
             "get_group_list" => {
-                let groups = self.get_group_list().await.map_err(AdapterError::Internal)?;
+                let groups = self
+                    .get_group_list()
+                    .await
+                    .map_err(AdapterError::Internal)?;
                 Ok(json!({"groups": id_name_pairs(groups)}))
             }
             "get_gated_friend_list" => {

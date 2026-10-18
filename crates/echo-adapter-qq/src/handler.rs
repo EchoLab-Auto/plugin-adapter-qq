@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::types::{AdapterEvent, ChannelType, IncomingFile, IncomingMessage};
+use async_trait::async_trait;
 use echo_core::{Event as OneBotEvent, NoticeEvent};
 use echo_server::{Context, HandleResult};
 
@@ -458,17 +458,18 @@ const MAX_EMBEDDED_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Shared HTTP client for image downloads (built once, process-wide).
 fn image_client() -> reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "reqwest builder failed, using client without timeouts");
-                reqwest::Client::new()
-            })
-    })
-    .clone()
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "reqwest builder failed, using client without timeouts");
+                    reqwest::Client::new()
+                })
+        })
+        .clone()
 }
 
 /// 把消息里的远程图片 URL 逐个下载并经 [`crate::media::MediaStore`] 登记
@@ -495,10 +496,7 @@ async fn persist_remote_images(
 }
 
 async fn persist_remote_image(url: String, store: &Arc<dyn crate::media::MediaStore>) -> String {
-    if crate::media::is_media_ref(&url)
-        || url.starts_with("data:")
-        || !url.starts_with("http")
-    {
+    if crate::media::is_media_ref(&url) || url.starts_with("data:") || !url.starts_with("http") {
         return url;
     }
     match download_and_store(&url, store).await {
@@ -1216,10 +1214,7 @@ mod tests {
             "sender": {"user_id": 999, "nickname": "other"}
         }))
         .unwrap();
-        assert_eq!(
-            handler.handle(&ctx, &event).await,
-            HandleResult::Handled
-        );
+        assert_eq!(handler.handle(&ctx, &event).await, HandleResult::Handled);
         let messages = hook.messages.lock().unwrap();
         assert_eq!(messages.len(), 2);
         assert!(messages[1].metadata.get("sender_role").is_none());
@@ -1321,7 +1316,10 @@ mod tests {
         let data = "data:image/png;base64,QUJD".to_string();
         assert_eq!(persist_remote_image(data.clone(), &store).await, data);
         let reference = "/media/abc.png".to_string();
-        assert_eq!(persist_remote_image(reference.clone(), &store).await, reference);
+        assert_eq!(
+            persist_remote_image(reference.clone(), &store).await,
+            reference
+        );
         assert!(
             recorder.saved.lock().unwrap().is_empty(),
             "passthrough must not register media"

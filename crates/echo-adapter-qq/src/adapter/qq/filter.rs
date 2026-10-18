@@ -131,7 +131,10 @@ impl QqAdapter {
         };
 
         if let Err(e) = store.patch(|root| {
-            let qq = crate::config_store::ensure_table(crate::config_store::ensure_table(root, "adapters"), "qq");
+            let qq = crate::config_store::ensure_table(
+                crate::config_store::ensure_table(root, "adapters"),
+                "qq",
+            );
 
             qq.insert(
                 "gate".into(),
@@ -200,7 +203,10 @@ impl QqAdapter {
             }
         };
         if let Err(e) = store.patch(|root| {
-            let qq = crate::config_store::ensure_table(crate::config_store::ensure_table(root, "adapters"), "qq");
+            let qq = crate::config_store::ensure_table(
+                crate::config_store::ensure_table(root, "adapters"),
+                "qq",
+            );
             qq.insert("owner_qq".into(), toml::Value::Integer(owner_qq));
             Ok(())
         }) {

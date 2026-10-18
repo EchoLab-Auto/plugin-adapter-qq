@@ -22,16 +22,14 @@
 
 use std::sync::{Arc, OnceLock};
 
-use echo_plugin_sdk::echo_plugin_api::{
-    AdapterCapabilities, AdapterContribution, InvokeOutcome,
-};
+use echo_plugin_sdk::echo_plugin_api::{AdapterCapabilities, AdapterContribution, InvokeOutcome};
 use echo_plugin_sdk::{AdapterPlugin, HostCallError, HostClient};
 use serde_json::{json, Value};
 
 use crate::config_store::ConfigStore;
 use crate::media::MediaStore;
 use crate::types::{
-    AdapterConnectionState, ChannelType, IncomingMessage, InboundMessageHook, MessageTarget,
+    AdapterConnectionState, ChannelType, InboundMessageHook, IncomingMessage, MessageTarget,
 };
 
 use crate::adapter::qq::DEFAULT_INSTANCE_NAME;
@@ -155,7 +153,8 @@ impl AdapterPlugin for QqPlugin {
             // owner）覆盖其上——崩溃重启不得回退到默认（安全相关）。
             apply_persisted_state(&mut parsed.config, path);
         }
-        let adapter = QqAdapter::with_instance(parsed.name.clone(), parsed.persona.clone(), parsed.config);
+        let adapter =
+            QqAdapter::with_instance(parsed.name.clone(), parsed.persona.clone(), parsed.config);
         if let Some(path) = &parsed.state_file {
             adapter.set_config_store(ConfigStore::new(path.clone()));
         }
@@ -168,7 +167,10 @@ impl AdapterPlugin for QqPlugin {
 
     fn adapter(&self) -> AdapterContribution {
         let (name, display_name) = match self.state.adapter.get() {
-            Some(adapter) => (adapter.name().to_string(), adapter.display_name().to_string()),
+            Some(adapter) => (
+                adapter.name().to_string(),
+                adapter.display_name().to_string(),
+            ),
             // 未配置（SDK 必先调 configure；此处仅防御）：占位身份。
             None => (DEFAULT_INSTANCE_NAME.to_string(), "QQ / OneBot".to_string()),
         };
@@ -189,6 +191,8 @@ impl AdapterPlugin for QqPlugin {
             config_schema: Some(ui::config_schema()),
             ui: Some(ui::ui_descriptor()),
             session_labels: Some(ui::session_labels()),
+            // 工具声明（平台语义在此；宿主 Core 不认识任何工具名）。
+            tools: crate::tools::contributions(),
         }
     }
 
@@ -196,6 +200,10 @@ impl AdapterPlugin for QqPlugin {
         let Some(adapter) = self.state.adapter.get().cloned() else {
             return error_outcome("not_configured", "qq plugin received no config");
         };
+        // 模型工具优先（工具名 → 内部 handler 的映射在 `tools` 模块）。
+        if let Some(outcome) = crate::tools::invoke(&adapter, op, payload.clone()).await {
+            return outcome;
+        }
         match op {
             "start" => match adapter.start().await {
                 Ok(()) => {
@@ -246,9 +254,7 @@ impl AdapterPlugin for QqPlugin {
             });
             adapter.set_message_hook(bridge);
             // 入站图片登记走宿主媒体库（`store_media`）。
-            adapter.set_media_store(Arc::new(HostMediaStore {
-                host: host.clone(),
-            }));
+            adapter.set_media_store(Arc::new(HostMediaStore { host: host.clone() }));
         } else {
             tracing::warn!("qq plugin on_ready before configure; inbound bridge not installed");
         }
@@ -290,7 +296,9 @@ impl InboundMessageHook for HostBridge {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(HostCallError::Service { code, .. }) if code == "backpressure" && attempt < 2 => {
+                Err(HostCallError::Service { code, .. })
+                    if code == "backpressure" && attempt < 2 =>
+                {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
                 }
@@ -311,7 +319,10 @@ impl InboundMessageHook for HostBridge {
                 "connected": connected,
                 "self_id": self_id,
             });
-            if let Err(e) = host.call(ADAPTER_HOST_SERVICE, "report_state", payload).await {
+            if let Err(e) = host
+                .call(ADAPTER_HOST_SERVICE, "report_state", payload)
+                .await
+            {
                 tracing::debug!(error = %e, "report_state host call failed");
             }
             // 连接态变化影响 `cached_state`（online / self_id）：刷新快照。
@@ -344,10 +355,8 @@ impl MediaStore for HostMediaStore {
     async fn store_image(&self, bytes: &[u8], mime: &str) -> Result<String, String> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "echo-qq-media-{}-{seq}.bin",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("echo-qq-media-{}-{seq}.bin", std::process::id()));
         std::fs::write(&path, bytes).map_err(|e| format!("write temp media: {e}"))?;
         let result = self
             .host
@@ -500,12 +509,15 @@ fn parse_target(payload: &Value, adapter_name: &str) -> Result<MessageTarget, (S
 }
 
 /// `send_text`：`{target, content}` → `{message_id?, success, error?}`。
-async fn send_text(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
+pub(crate) async fn send_text(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
     let target = match parse_target(payload, adapter.name()) {
         Ok(target) => target,
         Err((code, message)) => return error_outcome(code, message),
     };
-    let content = payload.get("content").and_then(Value::as_str).unwrap_or_default();
+    let content = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match adapter.send_message(&target, content).await {
         Ok(result) => ok_result(json!({
             "message_id": result.message_id,
@@ -529,7 +541,9 @@ async fn send_media(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
         Value::Object(map) => (
             map.get("url").and_then(Value::as_str).map(str::to_string),
             map.get("path").and_then(Value::as_str).map(str::to_string),
-            map.get("data_uri").and_then(Value::as_str).map(str::to_string),
+            map.get("data_uri")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             None,
         ),
         _ => (None, None, None, None),
@@ -544,7 +558,10 @@ async fn send_media(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
                     Err((code, message)) => return error_outcome(code, message),
                 }
             } else {
-                return error_outcome("invalid_payload", "send_media requires source url|path|data_uri");
+                return error_outcome(
+                    "invalid_payload",
+                    "send_media requires source url|path|data_uri",
+                );
             };
             match adapter.send_image(&target, &file).await {
                 Ok(result) => ok_result(json!({
@@ -586,7 +603,9 @@ async fn send_media(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
                     let Ok(user_id) = target.user_id.parse::<i64>() else {
                         return error_outcome("invalid_payload", "invalid user_id");
                     };
-                    adapter.upload_private_file(user_id, &path, &file_name).await
+                    adapter
+                        .upload_private_file(user_id, &path, &file_name)
+                        .await
                 }
                 ChannelType::Group { group_id } => {
                     let Ok(group_id) = group_id.parse::<i64>() else {
@@ -609,7 +628,7 @@ async fn send_media(adapter: &QqAdapter, payload: &Value) -> InvokeOutcome {
 
 /// 平台专属动作（门控 / 名单 / owner / 登录 / 目录）透传到
 /// [`AdapterManagement::invoke_custom`]。
-async fn custom_op(adapter: &QqAdapter, method: &str, payload: Value) -> InvokeOutcome {
+pub(crate) async fn custom_op(adapter: &QqAdapter, method: &str, payload: Value) -> InvokeOutcome {
     match adapter.invoke_custom(method, payload).await {
         Ok(result) => ok_result(result),
         Err(e) => error_outcome("adapter_error", e.to_string()),
@@ -649,7 +668,7 @@ fn state_str(state: AdapterConnectionState) -> &'static str {
 }
 
 /// 成功终态：结构化结果经 `result` 承载（`Ok.text` 对适配器 op 忽略）。
-fn ok_result(result: Value) -> InvokeOutcome {
+pub(crate) fn ok_result(result: Value) -> InvokeOutcome {
     InvokeOutcome::Ok {
         text: String::new(),
         images: Vec::new(),
@@ -658,7 +677,7 @@ fn ok_result(result: Value) -> InvokeOutcome {
 }
 
 /// 错误终态。
-fn error_outcome(code: impl Into<String>, message: impl Into<String>) -> InvokeOutcome {
+pub(crate) fn error_outcome(code: impl Into<String>, message: impl Into<String>) -> InvokeOutcome {
     InvokeOutcome::Error {
         code: code.into(),
         message: message.into(),
@@ -982,20 +1001,20 @@ mod tests {
 
         // 入站投递：hook（on_ready 已装）→ HostCall deliver_message。
         let adapter = plugin.adapter_handle().expect("adapter built");
-        let hook = adapter
-            .message_hook()
-            .expect("hook installed by on_ready");
-        let deliver = tokio::spawn(async move { hook.on_incoming_message(example_message()).await });
+        let hook = adapter.message_hook().expect("hook installed by on_ready");
+        let deliver =
+            tokio::spawn(async move { hook.on_incoming_message(example_message()).await });
         let payload = host.answer_host_call("deliver_message").await;
         assert_eq!(payload["message"]["adapter"], json!("qq-test"));
         assert_eq!(payload["message"]["content"], json!("hello"));
         assert!(deliver.await.expect("join").is_ok());
 
         // 连接态上报：report_state（spawn 的旁路任务）。
-        adapter
-            .message_hook()
-            .expect("hook")
-            .on_connection_state("qq-test", true, Some("4242".to_string()));
+        adapter.message_hook().expect("hook").on_connection_state(
+            "qq-test",
+            true,
+            Some("4242".to_string()),
+        );
         let payload = host.answer_host_call("report_state").await;
         assert_eq!(payload["adapter"], json!("qq-test"));
         assert_eq!(payload["connected"], json!(true));
@@ -1027,7 +1046,10 @@ mod tests {
         // 第一次生命周期：改门控 / owner / 名单 → 落盘。
         {
             let plugin = QqPlugin::new();
-            plugin.configure(base_config.clone()).await.expect("configure");
+            plugin
+                .configure(base_config.clone())
+                .await
+                .expect("configure");
             let adapter = plugin.adapter_handle().expect("adapter");
             adapter
                 .invoke_custom("set_gate_mode", json!({"mode": "allowlist"}))
@@ -1038,7 +1060,10 @@ mod tests {
                 .await
                 .expect("set owner");
             adapter
-                .invoke_custom("update_allowlist", json!({"user_ids": [7], "group_ids": [42]}))
+                .invoke_custom(
+                    "update_allowlist",
+                    json!({"user_ids": [7], "group_ids": [42]}),
+                )
                 .await
                 .expect("allowlist");
         }
@@ -1047,7 +1072,10 @@ mod tests {
 
         // 重启：宿主仍下发旧基线（none / owner 0）→ 持久化状态必须胜出。
         let plugin = QqPlugin::new();
-        plugin.configure(base_config.clone()).await.expect("reconfigure");
+        plugin
+            .configure(base_config.clone())
+            .await
+            .expect("reconfigure");
         let adapter = plugin.adapter_handle().expect("adapter");
         let gate = adapter
             .invoke_custom("get_gate_mode", Value::Null)
@@ -1069,7 +1097,10 @@ mod tests {
         // 状态文件丢失（模拟被清理）：回退基线，不阻塞启动。
         std::fs::remove_file(&state_file).expect("remove state file");
         let plugin = QqPlugin::new();
-        plugin.configure(base_config).await.expect("configure without state");
+        plugin
+            .configure(base_config)
+            .await
+            .expect("configure without state");
         let adapter = plugin.adapter_handle().expect("adapter");
         let gate = adapter
             .invoke_custom("get_gate_mode", Value::Null)
@@ -1141,7 +1172,9 @@ mod tests {
             contribution.session_labels,
             Some(json!({"dm": "QQ 私聊", "group": "QQ 群"}))
         );
-        let schema = contribution.config_schema.expect("config schema registered");
+        let schema = contribution
+            .config_schema
+            .expect("config schema registered");
         assert_eq!(schema["required"], json!(["bind_address"]));
     }
 
@@ -1200,7 +1233,9 @@ mod tests {
         host.handshake(json!({"name": "qq-test"}), "qq-test").await;
 
         let store = HostMediaStore {
-            host: plugin.host_handle().expect("host client installed by on_ready"),
+            host: plugin
+                .host_handle()
+                .expect("host client installed by on_ready"),
         };
         let store_task = tokio::spawn(async move {
             let bytes = vec![1u8, 2, 3];
@@ -1214,7 +1249,10 @@ mod tests {
                 assert_eq!(call.method, "store_media");
                 assert_eq!(call.payload["mime"], json!("image/png"));
                 let path = call.payload["path"].as_str().expect("path").to_string();
-                assert_eq!(std::fs::read(&path).expect("host reads temp file"), vec![1u8, 2, 3]);
+                assert_eq!(
+                    std::fs::read(&path).expect("host reads temp file"),
+                    vec![1u8, 2, 3]
+                );
                 host.send(&HostToPlugin::HostCallResult(HostCallResult {
                     call_id: call.call_id.clone(),
                     outcome: HostCallOutcome::Ok {

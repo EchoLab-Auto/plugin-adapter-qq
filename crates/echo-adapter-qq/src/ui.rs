@@ -285,7 +285,10 @@ mod tests {
     /// 会话标签（01a §2.2）：私聊 / 群聊显示名。
     #[test]
     fn session_labels_snapshot() {
-        assert_eq!(session_labels(), json!({ "dm": "QQ 私聊", "group": "QQ 群" }));
+        assert_eq!(
+            session_labels(),
+            json!({ "dm": "QQ 私聊", "group": "QQ 群" })
+        );
     }
 
     /// 配置 Schema（01a §2.2）：对象 + required + 五个配置字段。
