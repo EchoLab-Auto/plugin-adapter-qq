@@ -293,7 +293,15 @@ impl InstancePlugin for QqPlugin {
                     return error_outcome("invalid_payload", "custom requires `method`");
                 };
                 let inner = payload.get("payload").cloned().unwrap_or(Value::Null);
-                let outcome = custom_op(&adapter, method, inner).await;
+                // **工具名也是合法 method**：宿主侧的工具桥（Core
+                // `instance_tools`）统一经 `invoke_custom(<工具名>, <参数>)` 执行，
+                // 因此 `custom` 必须先过工具表，否则模型调 `send_private_msg`
+                // 会落到管理方法表里报 `unknown adapter method`
+                // （2026-10 实测踩到：10 个工具全部不可用）。
+                let outcome = match crate::tools::invoke(&adapter, method, inner.clone()).await {
+                    Some(outcome) => outcome,
+                    None => custom_op(&adapter, method, inner).await,
+                };
                 // 管理面状态可能已变（写方法）：推送快照，宿主缓存随之刷新。
                 self.push_ui_state();
                 outcome
@@ -1164,6 +1172,43 @@ mod tests {
         assert_eq!(gate["mode"], json!("none"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归（2026-10）：宿主工具桥统一经 `custom` op 执行工具
+    /// （Core `instance_tools::invoke_management` → `invoke_custom(<工具名>)`）。
+    ///
+    /// 若 `custom` 分支不过工具表，模型调 `send_private_msg` 会落到管理方法表
+    /// 并报 `unknown adapter method` —— 10 个工具全部不可用（实测踩到）。
+    /// 这里用「缺参数」的确定性错误证明请求确实进了工具表：`send_private_msg`
+    /// 无 `user_id` 时返回 `bad_args` / `user_id required`，而不是
+    /// `unknown adapter method`。
+    #[tokio::test]
+    async fn custom_op_reaches_tool_table() {
+        let plugin = QqPlugin::new();
+        plugin
+            .configure(json!({"name": "qq-tools", "config": {"gate": {"mode": "none"}}}))
+            .await
+            .expect("configure");
+
+        for tool in [
+            "send_private_msg",
+            "send_group_msg",
+            "send_image",
+            "send_file",
+            "send_voice",
+            "send_json_card",
+            "get_group_member_info",
+            "get_group_msg_history",
+        ] {
+            let outcome = plugin
+                .invoke_op("custom", json!({"method": tool, "payload": {}}))
+                .await;
+            let rendered = format!("{outcome:?}");
+            assert!(
+                !rendered.contains("unknown adapter method"),
+                "工具 `{tool}` 没有进工具表：{rendered}"
+            );
+        }
     }
 
     /// 写操作（custom）后推送管理面快照：`report_ui_state` 携带新门控模式。
