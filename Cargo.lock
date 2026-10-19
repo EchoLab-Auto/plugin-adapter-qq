@@ -297,6 +297,7 @@ dependencies = [
 [[package]]
 name = "echo-plugin-api"
 version = "0.1.0"
+source = "git+https://github.com/EchoLab-Auto/plugin-framework?tag=v0.1.0#8d4c11e753895066c080a7598351af3fa5fc626d"
 dependencies = [
  "serde",
  "serde_json",
@@ -305,6 +306,7 @@ dependencies = [
 [[package]]
 name = "echo-plugin-sdk"
 version = "0.1.0"
+source = "git+https://github.com/EchoLab-Auto/plugin-framework?tag=v0.1.0#8d4c11e753895066c080a7598351af3fa5fc626d"
 dependencies = [
  "async-trait",
  "echo-plugin-api",

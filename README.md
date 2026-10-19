@@ -61,7 +61,9 @@ cargo test --workspace
 ECHO_LOG=debug ./target/debug/echo-adapter-qq   # 手动调试（日志走 stderr）
 ```
 
-开发期 `echo-plugin-sdk` 以本机 path 依赖（`~/.local/share/echo-agent-core/source/source/plugin/echo-plugin-sdk`）；SDK 发布后切换 git tag。
+`echo-plugin-sdk` 来自独立框架仓 [plugin-framework](https://github.com/EchoLab-Auto/plugin-framework)，
+按 tag 钉住（`tag = "v0.1.0"`），`Cargo.lock` 进一步钉死 rev。升级 SDK 只需改这一行 tag。
+`sdk` 已 re-export `echo_plugin_api`，本仓不需要单独声明协议 crate。
 
 ## 部署
 

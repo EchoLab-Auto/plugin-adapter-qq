@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
 license = "MIT"
-repository = ""
+repository = "https://github.com/EchoLab-Auto/plugin-adapter-qq"
 
 # 版本与 EchoAgentCore 根 Cargo.toml 保持一致（迁出期同步，避免行为漂移）。
 [workspace.dependencies]
