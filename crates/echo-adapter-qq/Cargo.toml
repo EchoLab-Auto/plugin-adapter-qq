@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 # 开发期：本机 path 依赖（SDK 未发布通道）；发布后切 git tag。
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework", tag = "v0.1.0" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework", tag = "v0.4.1" }
 echo-core = { path = "../echo-core" }
 echo-server = { path = "../echo-server" }
 tokio.workspace = true
